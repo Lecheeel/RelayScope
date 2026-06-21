@@ -1,0 +1,619 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from urllib.parse import urlparse
+from time import perf_counter
+from typing import Any, Protocol
+import json
+import uuid
+
+import httpx
+
+from .config import ClientProfile, ProtocolMode, TargetConfig
+
+
+@dataclass(slots=True)
+class ProviderResponse:
+    text: str
+    raw: dict[str, Any]
+    usage: dict[str, Any]
+    latency_ms: float
+    content_type: str = ""
+    request: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class ProviderStreamResponse:
+    text: str
+    raw_events: list[dict[str, Any]]
+    usage: dict[str, Any]
+    latency_ms: float
+    first_token_ms: float | None
+    chunk_count: int
+    content_type: str = ""
+    request: dict[str, Any] | None = None
+
+
+class ProviderClient(Protocol):
+    def complete(
+        self,
+        prompt: str = "",
+        *,
+        messages: list[dict[str, Any]] | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        cache_control: bool = False,
+    ) -> ProviderResponse:
+        ...
+
+    def stream_complete(
+        self,
+        prompt: str = "",
+        *,
+        messages: list[dict[str, Any]] | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+    ) -> ProviderStreamResponse:
+        ...
+
+
+class OpenAICompatibleClient:
+    def __init__(self, config: TargetConfig) -> None:
+        self.config = config
+
+    def complete(
+        self,
+        prompt: str = "",
+        *,
+        messages: list[dict[str, Any]] | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        cache_control: bool = False,
+    ) -> ProviderResponse:
+        payload = {
+            "model": self.config.model,
+            "messages": messages or [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        if tools is not None:
+            payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        if response_format is not None:
+            payload["response_format"] = _openai_chat_response_format(response_format)
+        _ = cache_control
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+            **self.config.extra_headers,
+        }
+        url = self.config.base_url.rstrip("/") + "/chat/completions"
+        started = perf_counter()
+        with httpx.Client(timeout=self.config.timeout_seconds) as client:
+            response = client.post(url, headers=headers, json=payload)
+            _raise_for_status(response)
+        latency_ms = (perf_counter() - started) * 1000
+        raw = _json_or_error(response)
+        raw["_response_headers"] = dict(response.headers)
+        request_info = _request_info("POST", url, headers, payload)
+        raw["_request"] = request_info
+        text = raw.get("choices", [{}])[0].get("message", {}).get("content") or ""
+        return ProviderResponse(
+            text=text,
+            raw=raw,
+            usage=raw.get("usage", {}),
+            latency_ms=latency_ms,
+            content_type=response.headers.get("content-type", ""),
+            request=request_info,
+        )
+
+    def stream_complete(
+        self,
+        prompt: str = "",
+        *,
+        messages: list[dict[str, Any]] | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+    ) -> ProviderStreamResponse:
+        payload = {
+            "model": self.config.model,
+            "messages": messages or [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+            **self.config.extra_headers,
+        }
+        url = self.config.base_url.rstrip("/") + "/chat/completions"
+        started = perf_counter()
+        first_token_ms: float | None = None
+        chunks: list[str] = []
+        events: list[dict[str, Any]] = []
+        usage: dict[str, Any] = {}
+        content_type = ""
+        with httpx.Client(timeout=self.config.timeout_seconds) as client:
+            with client.stream("POST", url, headers=headers, json=payload) as response:
+                _raise_for_status(response)
+                content_type = response.headers.get("content-type", "")
+                for event in _iter_sse_json(response):
+                    events.append(event)
+                    if isinstance(event.get("usage"), dict):
+                        usage = event["usage"]
+                    for choice in event.get("choices", []) or []:
+                        delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
+                        text = delta.get("content")
+                        if isinstance(text, str) and text:
+                            if first_token_ms is None:
+                                first_token_ms = (perf_counter() - started) * 1000
+                            chunks.append(text)
+        latency_ms = (perf_counter() - started) * 1000
+        request_info = _request_info("POST", url, headers, payload)
+        return ProviderStreamResponse(
+            text="".join(chunks),
+            raw_events=events,
+            usage=usage,
+            latency_ms=latency_ms,
+            first_token_ms=first_token_ms,
+            chunk_count=len(events),
+            content_type=content_type,
+            request=request_info,
+        )
+
+
+class OpenAIResponsesClient:
+    def __init__(self, config: TargetConfig) -> None:
+        self.config = config
+
+    def complete(
+        self,
+        prompt: str = "",
+        *,
+        messages: list[dict[str, Any]] | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        cache_control: bool = False,
+    ) -> ProviderResponse:
+        payload = {
+            "model": self.config.model,
+            "input": messages or prompt,
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+        }
+        if tools is not None:
+            payload["tools"] = _responses_tools(tools)
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        if response_format is not None:
+            payload["text"] = {"format": _responses_text_format(response_format)}
+        _ = cache_control
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "api-probe codex-responses profile",
+            **self.config.extra_headers,
+        }
+        url = self.config.base_url.rstrip("/") + "/responses"
+        started = perf_counter()
+        with httpx.Client(timeout=self.config.timeout_seconds) as client:
+            response = client.post(url, headers=headers, json=payload)
+            _raise_for_status(response)
+        latency_ms = (perf_counter() - started) * 1000
+        raw = _json_or_error(response)
+        raw["_response_headers"] = dict(response.headers)
+        request_info = _request_info("POST", url, headers, payload)
+        raw["_request"] = request_info
+        text = _extract_responses_text(raw)
+        return ProviderResponse(
+            text=text,
+            raw=raw,
+            usage=raw.get("usage", {}),
+            latency_ms=latency_ms,
+            content_type=response.headers.get("content-type", ""),
+            request=request_info,
+        )
+
+    def stream_complete(
+        self,
+        prompt: str = "",
+        *,
+        messages: list[dict[str, Any]] | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+    ) -> ProviderStreamResponse:
+        payload = {
+            "model": self.config.model,
+            "input": messages or prompt,
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+            "stream": True,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "api-probe codex-responses profile",
+            **self.config.extra_headers,
+        }
+        url = self.config.base_url.rstrip("/") + "/responses"
+        started = perf_counter()
+        first_token_ms: float | None = None
+        chunks: list[str] = []
+        events: list[dict[str, Any]] = []
+        usage: dict[str, Any] = {}
+        content_type = ""
+        with httpx.Client(timeout=self.config.timeout_seconds) as client:
+            with client.stream("POST", url, headers=headers, json=payload) as response:
+                _raise_for_status(response)
+                content_type = response.headers.get("content-type", "")
+                for event in _iter_sse_json(response):
+                    events.append(event)
+                    if isinstance(event.get("response"), dict) and isinstance(event["response"].get("usage"), dict):
+                        usage = event["response"]["usage"]
+                    if isinstance(event.get("usage"), dict):
+                        usage = event["usage"]
+                    delta = _responses_stream_text(event)
+                    if isinstance(delta, str) and delta:
+                        if first_token_ms is None:
+                            first_token_ms = (perf_counter() - started) * 1000
+                        chunks.append(delta)
+        latency_ms = (perf_counter() - started) * 1000
+        request_info = _request_info("POST", url, headers, payload)
+        return ProviderStreamResponse(
+            text="".join(chunks),
+            raw_events=events,
+            usage=usage,
+            latency_ms=latency_ms,
+            first_token_ms=first_token_ms,
+            chunk_count=len(events),
+            content_type=content_type,
+            request=request_info,
+        )
+
+
+class AnthropicClient:
+    def __init__(self, config: TargetConfig) -> None:
+        self.config = config
+
+    def complete(
+        self,
+        prompt: str = "",
+        *,
+        messages: list[dict[str, Any]] | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        cache_control: bool = False,
+    ) -> ProviderResponse:
+        payload = {
+            "model": self.config.model,
+            "messages": _anthropic_messages(messages or [{"role": "user", "content": prompt}], cache_control=cache_control),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if tools is not None:
+            payload["tools"] = _anthropic_tools(tools)
+        if tool_choice is not None:
+            payload["tool_choice"] = _anthropic_tool_choice(tool_choice)
+        # Anthropic Messages API does not use OpenAI-style response_format.
+        _ = response_format
+        headers = {
+            "anthropic-version": self.config.extra_headers.get("anthropic-version", "2023-06-01"),
+            "Content-Type": "application/json",
+            **self.config.extra_headers,
+        }
+        if self.config.client_profile == ClientProfile.CLAUDE_CODE:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+            headers["User-Agent"] = "api-probe claude-code profile"
+            headers.setdefault("X-Claude-Code-Session-Id", str(uuid.uuid4()))
+            headers.setdefault("X-Claude-Code-Agent-Id", str(uuid.uuid4()))
+        else:
+            headers["x-api-key"] = self.config.api_key
+        url = self.config.base_url.rstrip("/") + "/messages"
+        started = perf_counter()
+        with httpx.Client(timeout=self.config.timeout_seconds) as client:
+            response = client.post(url, headers=headers, json=payload)
+            _raise_for_status(response)
+        latency_ms = (perf_counter() - started) * 1000
+        raw = _json_or_error(response)
+        raw["_response_headers"] = dict(response.headers)
+        request_info = _request_info("POST", url, headers, payload)
+        raw["_request"] = request_info
+        text_parts = [
+            part.get("text", "")
+            for part in raw.get("content", [])
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        return ProviderResponse(
+            text="".join(text_parts),
+            raw=raw,
+            usage=raw.get("usage", {}),
+            latency_ms=latency_ms,
+            content_type=response.headers.get("content-type", ""),
+            request=request_info,
+        )
+
+    def stream_complete(
+        self,
+        prompt: str = "",
+        *,
+        messages: list[dict[str, Any]] | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+    ) -> ProviderStreamResponse:
+        payload = {
+            "model": self.config.model,
+            "messages": _anthropic_messages(messages or [{"role": "user", "content": prompt}]),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        headers = {
+            "anthropic-version": self.config.extra_headers.get("anthropic-version", "2023-06-01"),
+            "Content-Type": "application/json",
+            **self.config.extra_headers,
+        }
+        if self.config.client_profile == ClientProfile.CLAUDE_CODE:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+            headers["User-Agent"] = "api-probe claude-code profile"
+            headers.setdefault("X-Claude-Code-Session-Id", str(uuid.uuid4()))
+            headers.setdefault("X-Claude-Code-Agent-Id", str(uuid.uuid4()))
+        else:
+            headers["x-api-key"] = self.config.api_key
+        url = self.config.base_url.rstrip("/") + "/messages"
+        started = perf_counter()
+        first_token_ms: float | None = None
+        chunks: list[str] = []
+        events: list[dict[str, Any]] = []
+        usage: dict[str, Any] = {}
+        content_type = ""
+        with httpx.Client(timeout=self.config.timeout_seconds) as client:
+            with client.stream("POST", url, headers=headers, json=payload) as response:
+                _raise_for_status(response)
+                content_type = response.headers.get("content-type", "")
+                for event in _iter_sse_json(response):
+                    events.append(event)
+                    if isinstance(event.get("usage"), dict):
+                        usage.update(event["usage"])
+                    if isinstance(event.get("message"), dict) and isinstance(event["message"].get("usage"), dict):
+                        usage.update(event["message"]["usage"])
+                    delta = event.get("delta", {})
+                    text = delta.get("text") if isinstance(delta, dict) else None
+                    if isinstance(text, str) and text:
+                        if first_token_ms is None:
+                            first_token_ms = (perf_counter() - started) * 1000
+                        chunks.append(text)
+        latency_ms = (perf_counter() - started) * 1000
+        request_info = _request_info("POST", url, headers, payload)
+        return ProviderStreamResponse(
+            text="".join(chunks),
+            raw_events=events,
+            usage=usage,
+            latency_ms=latency_ms,
+            first_token_ms=first_token_ms,
+            chunk_count=len(events),
+            content_type=content_type,
+            request=request_info,
+        )
+
+
+def build_client(config: TargetConfig) -> ProviderClient:
+    if config.protocol_mode == ProtocolMode.OPENAI_RESPONSES:
+        return OpenAIResponsesClient(config)
+    if config.provider_family.value == "openai":
+        return OpenAICompatibleClient(config)
+    if config.provider_family.value == "anthropic":
+        return AnthropicClient(config)
+    raise ValueError(f"Unsupported provider family: {config.provider_family}")
+
+
+def _json_or_error(response: httpx.Response) -> dict[str, Any]:
+    content_type = response.headers.get("content-type", "")
+    try:
+        return response.json()
+    except ValueError as exc:
+        preview = response.text[:300].replace("\n", " ")
+        hint = ""
+        if "text/html" in content_type.lower():
+            parsed = urlparse(str(response.request.url))
+            if parsed.path.rstrip("/") in {"", "/chat/completions", "/messages", "/responses"}:
+                hint = " This endpoint returned HTML; the base_url may point at the site root instead of the API root. Try adding /v1."
+        raise RuntimeError(
+            f"Expected JSON response, got content-type={content_type!r}, "
+            f"status={response.status_code}, body_preview={preview!r}{hint}"
+        ) from exc
+
+
+def _raise_for_status(response: httpx.Response) -> None:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        preview = response.text[:500].replace("\n", " ")
+        raise httpx.HTTPStatusError(
+            f"{exc} | body_preview={preview!r}",
+            request=exc.request,
+            response=exc.response,
+        ) from exc
+
+
+def _request_info(method: str, url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "method": method,
+        "url": url,
+        "headers": _redact_headers(headers),
+        "json": payload,
+    }
+
+
+def _redact_headers(headers: dict[str, str]) -> dict[str, str]:
+    redacted = {}
+    for key, value in headers.items():
+        lowered = key.lower()
+        if lowered in {"authorization", "x-api-key", "api-key"}:
+            redacted[key] = "***REDACTED***"
+        else:
+            redacted[key] = value
+    return redacted
+
+
+def _iter_sse_json(response: httpx.Response) -> list[dict[str, Any]]:
+    for line in response.iter_lines():
+        if not line.startswith("data:"):
+            continue
+        data = line.removeprefix("data:").strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            yield parsed
+
+
+def _extract_responses_text(raw: dict[str, Any]) -> str:
+    if isinstance(raw.get("output_text"), str):
+        return raw["output_text"]
+    chunks: list[str] = []
+    for item in raw.get("output", []):
+        if not isinstance(item, dict):
+            continue
+        for part in item.get("content", []):
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                chunks.append(part["text"])
+    return "".join(chunks)
+
+
+def _responses_stream_text(event: dict[str, Any]) -> str | None:
+    delta = event.get("delta")
+    if isinstance(delta, str):
+        return delta
+    if event.get("type") == "response.output_text.delta" and isinstance(event.get("text"), str):
+        return event["text"]
+    output_text = event.get("output_text")
+    if isinstance(output_text, str):
+        return output_text
+    return None
+
+
+def _responses_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        if tool.get("type") != "function":
+            converted.append(tool)
+            continue
+        function = tool.get("function", {})
+        converted.append(
+            {
+                "type": "function",
+                "name": function.get("name"),
+                "description": function.get("description", ""),
+                "parameters": function.get("parameters", {}),
+            }
+        )
+    return converted
+
+
+def _openai_chat_response_format(response_format: dict[str, Any]) -> dict[str, Any]:
+    if response_format.get("type") != "json_schema":
+        return response_format
+    if "json_schema" in response_format:
+        return response_format
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": response_format.get("name", "api_probe_result"),
+            "schema": response_format.get("schema", {}),
+            "strict": response_format.get("strict", True),
+        },
+    }
+
+
+def _responses_text_format(response_format: dict[str, Any]) -> dict[str, Any]:
+    if response_format.get("type") != "json_schema":
+        return response_format
+    if "json_schema" in response_format:
+        json_schema = response_format["json_schema"]
+        return {
+            "type": "json_schema",
+            "name": json_schema.get("name", "api_probe_result"),
+            "schema": json_schema.get("schema", {}),
+            "strict": json_schema.get("strict", response_format.get("strict", True)),
+        }
+    return {
+        "type": "json_schema",
+        "name": response_format.get("name", "api_probe_result"),
+        "schema": response_format.get("schema", {}),
+        "strict": response_format.get("strict", True),
+    }
+
+
+def _anthropic_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        if tool.get("type") != "function":
+            converted.append(tool)
+            continue
+        function = tool.get("function", {})
+        converted.append(
+            {
+                "name": function.get("name"),
+                "description": function.get("description", ""),
+                "input_schema": function.get("parameters", {}),
+            }
+        )
+    return converted
+
+
+def _anthropic_tool_choice(tool_choice: str | dict[str, Any]) -> dict[str, Any] | str:
+    if isinstance(tool_choice, dict):
+        function = tool_choice.get("function", {})
+        if tool_choice.get("type") == "function" and function.get("name"):
+            return {"type": "tool", "name": function["name"]}
+        return tool_choice
+    if tool_choice == "auto":
+        return {"type": "auto"}
+    if tool_choice == "required":
+        return {"type": "any"}
+    return tool_choice
+
+
+def _anthropic_messages(messages: list[dict[str, Any]], *, cache_control: bool = False) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    last_index = len(messages) - 1
+    for index, message in enumerate(messages):
+        role = message.get("role", "user")
+        content = message.get("content", "")
+        if cache_control and index == last_index and role == "user" and isinstance(content, str):
+            normalized.append(
+                {
+                    "role": role,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": content,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            )
+        elif isinstance(content, str):
+            normalized.append({"role": role, "content": content})
+        else:
+            normalized.append({"role": role, "content": content})
+    return normalized

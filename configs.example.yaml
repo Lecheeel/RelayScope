@@ -1,0 +1,24 @@
+output_dir: runs
+
+targets:
+  - name: relay-gpt55
+    provider_family: openai
+    protocol_mode: openai_compat
+    base_url: https://relay.example.com
+    api_key: ${OPENAI_RELAY_API_KEY}
+    model: gpt-5.5
+    profiles:
+      - openai-chat
+      - codex-responses
+
+  - name: relay-claude46
+    provider_family: anthropic
+    protocol_mode: anthropic_native
+    base_url: https://relay.example.com
+    api_key: ${ANTHROPIC_RELAY_API_KEY}
+    model: claude-sonnet-4-6
+    profiles:
+      - anthropic-messages
+      - claude-code
+    extra_headers:
+      anthropic-version: "2023-06-01"

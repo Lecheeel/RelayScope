@@ -1,0 +1,32 @@
+# Local logs
+*.log
+api-probe-web.err.log
+api-probe-web.out.log
+
+# Local notes / test checklist
+测试项.md
+
+# Probe outputs
+runs/
+reports/
+
+# Secrets / local config
+configs.yaml
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
