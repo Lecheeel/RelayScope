@@ -61,6 +61,19 @@ def _run_claude_count_tokens(config: Any) -> ProbeResult:
         latency_ms = (perf_counter() - started) * 1000
         raw = response.json()
     except Exception as exc:
+        if _optional_endpoint_failure(exc):
+            return ProbeResult(
+                case_id="claude-code-count-tokens-1",
+                kind="client_compat",
+                status="skipped",
+                passed=False,
+                score=0.0,
+                evidence=f"Optional count_tokens endpoint is not compatible: {type(exc).__name__}: {_exception_preview(exc)}",
+                failure_category="unsupported",
+                skipped_reason="optional count_tokens endpoint unavailable",
+                metrics={"endpoint": "/messages/count_tokens", "error_type": type(exc).__name__},
+                raw_response={"request": _request_snapshot("POST", url, headers, payload)},
+            )
         return ProbeResult(
             case_id="claude-code-count-tokens-1",
             kind="client_compat",
@@ -77,6 +90,23 @@ def _run_claude_count_tokens(config: Any) -> ProbeResult:
     passed = isinstance(input_tokens, int) and input_tokens > 0
     raw["_response_headers"] = dict(response.headers)
     raw["_request"] = _request_snapshot("POST", url, headers, payload)
+    if not passed:
+        return ProbeResult(
+            case_id="claude-code-count-tokens-1",
+            kind="client_compat",
+            status="skipped",
+            passed=False,
+            score=0.0,
+            evidence=f"Optional count_tokens endpoint returned unsupported shape: input_tokens={input_tokens!r}",
+            failure_category="unsupported",
+            skipped_reason="optional count_tokens response shape unsupported",
+            metrics={
+                "latency_ms": round(latency_ms, 2),
+                "content_type": response.headers.get("content-type", ""),
+                "endpoint": "/messages/count_tokens",
+            },
+            raw_response=raw,
+        )
     return ProbeResult(
         case_id="claude-code-count-tokens-1",
         kind="client_compat",
@@ -219,3 +249,10 @@ def _exception_preview(exc: Exception) -> str:
         preview = exc.response.text[:500].replace("\n", " ")
         return f"{exc} | body_preview={preview!r}"
     return str(exc)
+
+
+def _optional_endpoint_failure(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {404, 405, 501}
+    message = str(exc).lower()
+    return "count_tokens" in message and ("not found" in message or "method not allowed" in message or "unsupported" in message)

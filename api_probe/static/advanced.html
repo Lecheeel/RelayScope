@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>API Probe</title>
+  <title>API Probe - 高级测试</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link rel="stylesheet" href="/styles.css">
 </head>
@@ -11,17 +11,16 @@
   <main>
     <header>
       <div>
-        <h1>API Probe</h1>
-        <p>模拟真实客户端，识别掺水中转、假模型、降质模型、缓存倍率和可疑计费。</p>
+        <h1>高级测试</h1>
+        <p>手动指定模型、客户端配置和检测参数，用于更细的中转站排查。</p>
       </div>
       <div class="header-actions">
-        <button class="btn btn-sm btn-outline-secondary" id="settingsButton" type="button">设置</button>
+        <a class="btn btn-sm btn-outline-secondary" href="/">返回主页面</a>
         <div class="status" id="statusText">待检测</div>
       </div>
     </header>
-
     <div class="layout">
-      <section class="form-panel" aria-label="probe form">
+      <section class="form-panel">
         <form id="probeForm">
           <div class="field">
             <label for="providerFamily">服务商类型</label>
@@ -39,19 +38,52 @@
             <label for="apiKey">API Key</label>
             <input id="apiKey" name="api_key" type="password" required autocomplete="off" placeholder="sk-...">
           </div>
+          <div class="field">
+            <label for="modelName">模型名称</label>
+            <input id="modelName" name="model" type="text" autocomplete="off" placeholder="手动指定模型名称">
+          </div>
+          <div class="field">
+            <label for="clientProfile">客户端配置</label>
+            <select id="clientProfile" name="client_profile">
+              <option value="auto">自动推荐</option>
+              <option value="codex-responses">Codex / Responses</option>
+              <option value="openai-chat">OpenAI Chat</option>
+              <option value="claude-code">Claude Code</option>
+              <option value="anthropic-messages">Anthropic Messages</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="settingTimeout">请求超时（秒）</label>
+            <input class="form-control" id="settingTimeout" type="number" min="10" max="240" step="1">
+          </div>
+          <div class="field">
+            <label for="settingConcurrency">并发探针数</label>
+            <input class="form-control" id="settingConcurrency" type="number" min="1" max="8" step="1">
+            <div class="form-text">首个身份/元数据探针固定先跑；后续探针按该值并发。</div>
+          </div>
+          <div class="field">
+            <label for="settingRetries">最大重试次数</label>
+            <input class="form-control" id="settingRetries" name="max_retries" type="number" min="0" max="5" step="1">
+            <div class="form-text">只重试超时、连接中断、502/503/504 等临时错误。</div>
+          </div>
+          <div class="field">
+            <label for="settingRetryBackoff">重试退避（秒）</label>
+            <input class="form-control" id="settingRetryBackoff" name="retry_backoff_seconds" type="number" min="0.1" max="5" step="0.1">
+          </div>
+          <div class="field">
+            <label for="settingCacheDelay">缓存探针间隔（秒）</label>
+            <input class="form-control" id="settingCacheDelay" name="cache_probe_delay_seconds" type="number" min="0" max="5" step="0.1">
+            <div class="form-text">缓存探针会串行放到最后执行，并在重复请求之间等待该时长。</div>
+          </div>
           <button id="runButton" type="submit">开始检测</button>
           <p class="fine-print">Key 只发送到本机后端用于本次请求，不写入报告文件。</p>
         </form>
       </section>
-
       <section class="results" aria-live="polite">
-        <div id="resultRoot" class="empty">
-          <p>先填 API 地址和 Key，再选择服务商类型开始检测。</p>
-        </div>
+        <div id="resultRoot" class="empty"><p>输入 API 地址和 Key 后开始检测。</p></div>
       </section>
     </div>
   </main>
-
   <div id="modelModal" class="model-backdrop" role="dialog" aria-modal="true" aria-labelledby="modelModalTitle">
     <div class="model-dialog">
       <div class="modal-head">
@@ -61,51 +93,6 @@
       <div id="modelList" class="model-list"></div>
     </div>
   </div>
-
-  <div class="modal fade" id="settingsModal" tabindex="-1" aria-labelledby="settingsModalTitle" aria-hidden="true">
-    <div class="modal-dialog">
-      <div class="modal-content">
-        <div class="modal-header">
-          <div>
-            <h2 class="modal-title fs-5" id="settingsModalTitle">设置</h2>
-            <div class="text-secondary small">调整检测参数；高级测试在独立页面。</div>
-          </div>
-          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
-        </div>
-        <div class="modal-body">
-          <div class="mb-3">
-            <label class="form-label" for="settingTimeout">请求超时（秒）</label>
-            <input class="form-control" id="settingTimeout" type="number" min="10" max="240" step="1">
-          </div>
-          <div class="mb-3">
-            <label class="form-label" for="settingConcurrency">并发探针数</label>
-            <input class="form-control" id="settingConcurrency" type="number" min="1" max="8" step="1">
-            <div class="form-text">首个身份/元数据探针固定先跑；后续探针按该值并发。</div>
-          </div>
-          <div class="mb-3">
-            <label class="form-label" for="settingRetries">最大重试次数</label>
-            <input class="form-control" id="settingRetries" name="max_retries" type="number" min="0" max="5" step="1">
-            <div class="form-text">只重试超时、连接中断、502/503/504 等临时错误。</div>
-          </div>
-          <div class="mb-3">
-            <label class="form-label" for="settingRetryBackoff">重试退避（秒）</label>
-            <input class="form-control" id="settingRetryBackoff" name="retry_backoff_seconds" type="number" min="0.1" max="5" step="0.1">
-          </div>
-          <div class="mb-3">
-            <label class="form-label" for="settingCacheDelay">缓存探针间隔（秒）</label>
-            <input class="form-control" id="settingCacheDelay" name="cache_probe_delay_seconds" type="number" min="0" max="5" step="0.1">
-            <div class="form-text">缓存探针会串行放到最后执行，并在重复请求之间等待该时长。</div>
-          </div>
-          <a class="btn btn-outline-secondary w-100" href="/advanced.html">打开高级测试页面</a>
-        </div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">关闭</button>
-          <button type="button" class="btn btn-primary" id="saveSettingsButton">保存</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
   <div class="modal fade" id="detailModal" tabindex="-1" aria-labelledby="detailModalTitle" aria-hidden="true">
     <div class="modal-dialog modal-fullscreen-xl-down modal-xl modal-dialog-scrollable">
       <div class="modal-content">
@@ -120,7 +107,6 @@
       </div>
     </div>
   </div>
-
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
   <script type="module" src="/app.js"></script>
 </body>

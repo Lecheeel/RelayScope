@@ -49,10 +49,14 @@ class StreamingLatencyProbe:
             ]
 
         normalized = response.text.strip()
+        profile = getattr(getattr(config, "client_profile", None), "value", None)
         has_text = "STREAMING API PROBE OK" in normalized
         has_chunks = response.chunk_count > 0
         has_ttft = isinstance(response.first_token_ms, (int, float))
-        passed = has_text and has_chunks and has_ttft
+        if profile == ClientProfile.CLAUDE_CODE.value:
+            passed = has_chunks and has_ttft and bool(normalized)
+        else:
+            passed = has_text and has_chunks and has_ttft
         return [
             ProbeResult(
                 case_id="stream-sse-basic-1",

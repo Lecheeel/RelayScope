@@ -5,201 +5,234 @@ const SETTINGS_KEY = "apiProbeSettings";
 const DEFAULT_SETTINGS = {
   timeout_seconds: 60,
   max_concurrency: 3,
+  max_retries: 2,
+  retry_backoff_seconds: 0.8,
+  cache_probe_delay_seconds: 1.2,
 };
 
 const form = document.querySelector("#probeForm");
-    const button = document.querySelector("#runButton");
-    const statusText = document.querySelector("#statusText");
-    const resultRoot = document.querySelector("#resultRoot");
-    const settingsButton = document.querySelector("#settingsButton");
-    const saveSettingsButton = document.querySelector("#saveSettingsButton");
-    const settingTimeout = document.querySelector("#settingTimeout");
-    const settingConcurrency = document.querySelector("#settingConcurrency");
-    const settingsModalElement = document.querySelector("#settingsModal");
-    const modelModal = document.querySelector("#modelModal");
-    const modelList = document.querySelector("#modelList");
-    const closeModelModal = document.querySelector("#closeModelModal");
-    const detailModalElement = document.querySelector("#detailModal");
-    const detailModalTitle = document.querySelector("#detailModalTitle");
-    const detailModalSubtitle = document.querySelector("#detailModalSubtitle");
-    const detailModalBody = document.querySelector("#detailModalBody");
-    const detailModal = window.bootstrap ? new bootstrap.Modal(detailModalElement) : null;
-    const settingsModal = window.bootstrap ? new bootstrap.Modal(settingsModalElement) : null;
-    let resolveModelChoice = null;
-    let latestResults = [];
-    let settings = loadSettings();
+const button = document.querySelector("#runButton");
+const statusText = document.querySelector("#statusText");
+const resultRoot = document.querySelector("#resultRoot");
+const settingTimeout = document.querySelector("#settingTimeout");
+const settingConcurrency = document.querySelector("#settingConcurrency");
+const settingRetries = document.querySelector("#settingRetries");
+const settingRetryBackoff = document.querySelector("#settingRetryBackoff");
+const settingCacheDelay = document.querySelector("#settingCacheDelay");
+const settingsButton = document.querySelector("#settingsButton");
+const settingsModalElement = document.querySelector("#settingsModal");
+const saveSettingsButton = document.querySelector("#saveSettingsButton");
+const settingsModal = settingsModalElement && window.bootstrap ? new bootstrap.Modal(settingsModalElement) : null;
+const modelModal = document.querySelector("#modelModal");
+const modelList = document.querySelector("#modelList");
+const closeModelModal = document.querySelector("#closeModelModal");
+const detailModalElement = document.querySelector("#detailModal");
+const detailModalTitle = document.querySelector("#detailModalTitle");
+const detailModalSubtitle = document.querySelector("#detailModalSubtitle");
+const detailModalBody = document.querySelector("#detailModalBody");
+const detailModal = window.bootstrap ? new bootstrap.Modal(detailModalElement) : null;
+let resolveModelChoice = null;
+let latestResults = [];
+let settings = loadSettings();
 
-    applySettingsToForm();
+applySettingsToForm();
 
-    settingsButton.addEventListener("click", () => {
-      applySettingsToForm();
-      if (settingsModal) settingsModal.show();
-    });
+settingsButton.addEventListener("click", () => {
+  applySettingsToForm();
+  if (settingsModal) settingsModal.show();
+});
 
-    saveSettingsButton.addEventListener("click", () => {
-      settings = normalizeSettings({
-        timeout_seconds: Number(settingTimeout.value),
-        max_concurrency: Number(settingConcurrency.value),
-      });
-      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-      if (settingsModal) settingsModal.hide();
-      statusText.textContent = `设置已保存：超时 ${settings.timeout_seconds}s，并发 ${settings.max_concurrency}`;
-    });
+saveSettingsButton.addEventListener("click", () => {
+  settings = normalizeSettings({
+    timeout_seconds: Number(settingTimeout.value),
+    max_concurrency: Number(settingConcurrency.value),
+    max_retries: Number(settingRetries.value),
+    retry_backoff_seconds: Number(settingRetryBackoff.value),
+    cache_probe_delay_seconds: Number(settingCacheDelay.value),
+  });
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  if (settingsModal) settingsModal.hide();
+  statusText.textContent = `设置已保存：超时 ${settings.timeout_seconds}s，并发 ${settings.max_concurrency}`;
+});
 
-    closeModelModal.addEventListener("click", () => closeModelPicker(null));
-    modelModal.addEventListener("click", (event) => {
-      if (event.target === modelModal) {
-        closeModelPicker(null);
+closeModelModal.addEventListener("click", () => closeModelPicker(null));
+modelModal.addEventListener("click", (event) => {
+  if (event.target === modelModal) {
+    closeModelPicker(null);
+  }
+});
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(form).entries());
+  const providerFamilyAuto = data.provider_family === "auto" || !data.provider_family;
+  settings = normalizeSettings({
+    timeout_seconds: Number(data.timeout_seconds),
+    max_concurrency: Number(data.max_concurrency),
+    max_retries: Number(data.max_retries),
+    retry_backoff_seconds: Number(data.retry_backoff_seconds),
+    cache_probe_delay_seconds: Number(data.cache_probe_delay_seconds),
+  });
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  Object.assign(data, settings);
+  if (providerFamilyAuto && String(data.model || "").trim()) {
+    data.provider_family = inferProviderFamily(data.model);
+  }
+  if (data.client_profile === "auto" || !data.client_profile) {
+    data.client_profile = "";
+  }
+
+  setBusy(true);
+  try {
+    if (!String(data.model || "").trim()) {
+      renderLoading("正在获取可用模型。");
+      const models = await fetchModels(data);
+      statusText.textContent = `已获取 ${models.length} 个模型`;
+      const selectedModel = await openModelPicker(models);
+      if (!selectedModel) {
+        statusText.textContent = "已取消";
+        renderEmpty();
+        return;
       }
-    });
-
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const data = Object.fromEntries(new FormData(form).entries());
-      Object.assign(data, settings);
-
-      setBusy(true);
-      try {
-        if (!String(data.model || "").trim()) {
-          renderLoading("正在获取模型列表。");
-          const models = await fetchModels(data);
-          statusText.textContent = `已获取 ${models.length} 个模型`;
-          const selectedModel = await openModelPicker(models);
-          if (!selectedModel) {
-            statusText.textContent = "已取消";
-            renderEmpty();
-            return;
-          }
-          data.model = selectedModel;
-        }
-        renderLoading("正在启动检测任务。");
-        const body = await startProbe(data);
-        await pollProbeJob(body.job_id);
-      } catch (error) {
-        renderError(error.message);
-        statusText.textContent = "检测失败";
-      } finally {
-        setBusy(false);
-      }
-    });
-
-    async function pollProbeJob(jobId) {
-      while (true) {
-        const job = await fetchProbeJob(jobId);
-        if (job.status === "failed") {
-          throw new Error(job.error || "检测失败");
-        }
-        if (job.status === "completed") {
-          renderResult(job);
-          statusText.textContent = "检测完成";
-          return;
-        }
-        renderProgress(job);
-        await delay(1000);
+      data.model = selectedModel;
+      if (providerFamilyAuto) {
+        data.provider_family = inferProviderFamily(data.model);
       }
     }
+    renderLoading("正在启动检测。");
+    const body = await startProbe(data);
+    await pollProbeJob(body.job_id);
+  } catch (error) {
+    renderError(error.message);
+    statusText.textContent = "检测失败";
+  } finally {
+    setBusy(false);
+  }
+});
 
-    function setBusy(isBusy) {
-      button.disabled = isBusy;
-      button.textContent = isBusy ? "检测中..." : "开始检测";
-      statusText.textContent = isBusy ? "正在检测" : statusText.textContent;
+async function pollProbeJob(jobId) {
+  while (true) {
+    const job = await fetchProbeJob(jobId);
+    if (job.status === "failed") {
+      throw new Error(job.error || "检测失败");
     }
-
-    function openModelPicker(models) {
-      modelList.innerHTML = "";
-      for (const model of models) {
-        const item = document.createElement("button");
-        item.type = "button";
-        item.className = "model-option";
-        item.textContent = model;
-        item.addEventListener("click", () => closeModelPicker(model));
-        modelList.appendChild(item);
-      }
-      modelModal.classList.add("open");
-      return new Promise((resolve) => {
-        resolveModelChoice = resolve;
-      });
+    if (job.status === "completed") {
+      renderResult(job);
+      statusText.textContent = "检测完成";
+      return;
     }
+    renderProgress(job);
+    await delay(1000);
+  }
+}
 
-    function closeModelPicker(model) {
-      modelModal.classList.remove("open");
-      if (resolveModelChoice) {
-        resolveModelChoice(model);
-        resolveModelChoice = null;
-      }
-    }
+function setBusy(isBusy) {
+  button.disabled = isBusy;
+  button.textContent = isBusy ? "检测中..." : "开始检测";
+  statusText.textContent = isBusy ? "正在检测" : statusText.textContent;
+}
 
-    function renderLoading(message) {
-      resultRoot.className = "empty";
-      resultRoot.innerHTML = `
-        <div class="text-center">
-          <div class="spinner-border text-secondary mb-3" role="status" aria-hidden="true"></div>
-          <p>${escapeHtml(message)}</p>
-        </div>
-      `;
-    }
+function openModelPicker(models) {
+  modelList.innerHTML = "";
+  for (const model of models) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "model-option";
+    item.textContent = model;
+    item.addEventListener("click", () => closeModelPicker(model));
+    modelList.appendChild(item);
+  }
+  modelModal.classList.add("open");
+  return new Promise((resolve) => {
+    resolveModelChoice = resolve;
+  });
+}
 
-    function renderEmpty() {
-      resultRoot.className = "empty";
-      resultRoot.innerHTML = "<p>输入 URL 和 Key 后开始检测。</p>";
-    }
+function closeModelPicker(model) {
+  modelModal.classList.remove("open");
+  if (resolveModelChoice) {
+    resolveModelChoice(model);
+    resolveModelChoice = null;
+  }
+}
 
-    function renderError(message) {
-      resultRoot.className = "";
-      resultRoot.innerHTML = `<div class="error">${escapeHtml(message)}</div>`;
-    }
+function renderLoading(message) {
+  resultRoot.className = "empty";
+  resultRoot.innerHTML = `
+    <div class="loading-state">
+      <div class="spinner-border text-success" role="status" aria-hidden="true"></div>
+      <p>${escapeHtml(message)}<span class="loading-dots"><span></span><span></span><span></span></span></p>
+      <div class="loading-line" aria-hidden="true"><span></span></div>
+    </div>
+  `;
+}
 
-    function renderProgress(job) {
-      const progress = job.progress || {};
-      const total = progress.total_probes || 1;
-      const completed = progress.completed_probes || 0;
-      const percent = Math.round((completed / total) * 100);
-      statusText.textContent = `检测中 ${completed}/${total}`;
-      resultRoot.className = "";
-      resultRoot.innerHTML = `
-        <div class="progress-panel">
-          <div class="progress-top">
-            <span>当前：${escapeHtml(probeTitle(progress.current_probe) || "准备中")}</span>
-            <span>${completed}/${total} · ${progress.completed_results || 0} 条结果</span>
-          </div>
-          <div class="progress-bar">
-            <div class="progress-fill" style="width:${percent}%"></div>
-          </div>
-        </div>
-        ${renderPartialResults(job.results || [])}
-      `;
-    }
+function renderEmpty() {
+  resultRoot.className = "empty";
+  resultRoot.innerHTML = "<p>输入 API 地址和 Key 后开始检测。</p>";
+}
 
-    function renderPartialResults(results) {
-      if (!results.length) {
-        return `<div class="empty"><p>等待第一个探针结果。</p></div>`;
-      }
-      latestResults = results;
-      const rows = results.map(renderResultRow).join("");
-      return `
-        <div class="content">
-          <table>
-            <thead>
-              <tr>
-                <th>测试项</th>
-                <th>类型</th>
-                <th>状态</th>
-                <th>延迟</th>
-                <th>结论</th>
-              </tr>
-            </thead>
-            <tbody>${rows}</tbody>
-          </table>
-        </div>
-      `;
-    }
+function renderError(message) {
+  resultRoot.className = "";
+  resultRoot.innerHTML = `<div class="error">${escapeHtml(message)}</div>`;
+}
 
-    function renderResult(data) {
+function renderProgress(job) {
+  const progress = job.progress || {};
+  const total = progress.total_probes || 1;
+  const completed = progress.completed_probes || 0;
+  const percent = Math.round((completed / total) * 100);
+  const visibleResults = visibleProbeResults(job.results || []);
+  statusText.textContent = `检测中 ${completed}/${total}`;
+  resultRoot.className = "";
+  resultRoot.innerHTML = `
+    <div class="progress-panel">
+      <div class="progress-top">
+        <span class="progress-current">
+          <span class="spinner-border spinner-border-sm text-success" role="status" aria-hidden="true"></span>
+          当前：${escapeHtml(probeTitle(progress.current_probe) || "准备中")}
+        </span>
+        <span>${completed}/${total} · ${visibleResults.length} 条结果</span>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-fill progress-fill-active" style="width:${percent}%"></div>
+      </div>
+    </div>
+    ${renderPartialResults(visibleResults)}
+  `;
+}
+
+function renderPartialResults(results) {
+  if (!results.length) {
+    return `<div class="empty compact-empty"><p>等待第一个有效探针结果。</p></div>`;
+  }
+  latestResults = results;
+  const rows = results.map(renderResultRow).join("");
+  return `
+    <div class="content">
+      <table>
+        <thead>
+          <tr>
+            <th>测试项</th>
+            <th>类型</th>
+            <th>状态</th>
+            <th>延迟</th>
+            <th>结论</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderResult(data) {
       const summary = data.summary;
       const earlyStop = renderStopNotice(summary);
-      latestResults = data.results;
-      const rows = data.results.map(renderResultRow).join("");
-      const checks = data.results.map(renderCheck).join("");
+      const visibleResults = visibleProbeResults(data.results);
+      latestResults = visibleResults;
+      const rows = visibleResults.map(renderResultRow).join("");
+      const checks = visibleResults.map(renderCheck).join("");
 
       resultRoot.className = "";
       resultRoot.innerHTML = `
@@ -221,7 +254,7 @@ const form = document.querySelector("#probeForm");
           </div>
           ${renderAnalysisGrid(summary)}
           <h3 class="fine-print">检测项目</h3>
-          <div class="checks">${checks}</div>
+          <div class="checks">${checks || `<div class="check"><span>没有可显示的检测项。</span></div>`}</div>
         </div>
         <div class="collapsed-results">
           <details>
@@ -243,7 +276,7 @@ const form = document.querySelector("#probeForm");
       `;
     }
 
-    function renderAnalysisGrid(summary) {
+function renderAnalysisGrid(summary) {
       const items = [
         ["评分", summary.score],
         ["通过", `${summary.passed}/${summary.scored_count || summary.probe_count}`],
@@ -268,15 +301,15 @@ const form = document.querySelector("#probeForm");
       `).join("")}</div>`;
     }
 
-    function renderStopNotice(summary) {
+function renderStopNotice(summary) {
       if (!summary.stopped_early) return "";
       if (summary.stop_reason === "connectivity") {
         return `<div class="error">检测过程中出现 DNS、连接或超时错误，已停止后续探针，避免把后续项目全部误判为能力失败。请稍后重试或检查本机网络、DNS、代理和目标服务可用性。</div>`;
       }
-      return `<div class="error">认证、权限或模型通道检查失败，已停止后续探针。请确认 Key、URL、模型权限和鉴权方式。</div>`;
+      return `<div class="error">认证、权限或服务商配置检查失败，已停止后续探针。请确认 API Key、地址、模型权限和鉴权方式。</div>`;
     }
 
-    function renderCheck(item) {
+function renderCheck(item) {
       const icon = item.status === "passed" ? "✓" : item.status === "failed" ? "×" : "·";
       return `
         <div class="check ${escapeHtml(item.status)}">
@@ -286,7 +319,7 @@ const form = document.querySelector("#probeForm");
       `;
     }
 
-    function renderResultRow(item, index) {
+function renderResultRow(item, index) {
       const latency = item.metrics && item.metrics.latency_ms ? `${item.metrics.latency_ms} ms` : "-";
       const conclusion = buildConclusion(item);
       return `
@@ -303,7 +336,11 @@ const form = document.querySelector("#probeForm");
       `;
     }
 
-    function openDetail(index) {
+function visibleProbeResults(results) {
+  return (results || []).filter((item) => item.status !== "skipped");
+}
+
+function openDetail(index) {
       const item = latestResults[index];
       if (!item) return;
       detailModalTitle.textContent = `${clientLabel(item)} · ${caseTitle(item.case_id)}`;
@@ -314,9 +351,9 @@ const form = document.querySelector("#probeForm");
       }
     }
 
-    window.openDetail = openDetail;
+window.openDetail = openDetail;
 
-    function loadSettings() {
+function loadSettings() {
       try {
         return normalizeSettings(JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}"));
       } catch {
@@ -324,21 +361,36 @@ const form = document.querySelector("#probeForm");
       }
     }
 
-    function normalizeSettings(value) {
-      const timeout = Number(value.timeout_seconds);
-      const concurrency = Number(value.max_concurrency);
-      return {
-        timeout_seconds: Math.max(10, Math.min(240, Number.isFinite(timeout) ? Math.round(timeout) : DEFAULT_SETTINGS.timeout_seconds)),
-        max_concurrency: Math.max(1, Math.min(8, Number.isFinite(concurrency) ? Math.round(concurrency) : DEFAULT_SETTINGS.max_concurrency)),
-      };
-    }
+function normalizeSettings(value) {
+  const timeout = Number(value.timeout_seconds);
+  const concurrency = Number(value.max_concurrency);
+  const retries = Number(value.max_retries);
+  const backoff = Number(value.retry_backoff_seconds);
+  const cacheDelay = Number(value.cache_probe_delay_seconds);
+  return {
+    timeout_seconds: Math.max(10, Math.min(240, Number.isFinite(timeout) ? Math.round(timeout) : DEFAULT_SETTINGS.timeout_seconds)),
+    max_concurrency: Math.max(1, Math.min(8, Number.isFinite(concurrency) ? Math.round(concurrency) : DEFAULT_SETTINGS.max_concurrency)),
+    max_retries: Math.max(0, Math.min(5, Number.isFinite(retries) ? Math.round(retries) : DEFAULT_SETTINGS.max_retries)),
+    retry_backoff_seconds: Math.max(0.1, Math.min(5, Number.isFinite(backoff) ? Number(backoff.toFixed(1)) : DEFAULT_SETTINGS.retry_backoff_seconds)),
+    cache_probe_delay_seconds: Math.max(0, Math.min(5, Number.isFinite(cacheDelay) ? Number(cacheDelay.toFixed(1)) : DEFAULT_SETTINGS.cache_probe_delay_seconds)),
+  };
+}
 
-    function applySettingsToForm() {
-      settingTimeout.value = settings.timeout_seconds;
-      settingConcurrency.value = settings.max_concurrency;
-    }
+function applySettingsToForm() {
+  settingTimeout.value = settings.timeout_seconds;
+  settingConcurrency.value = settings.max_concurrency;
+  settingRetries.value = settings.max_retries;
+  settingRetryBackoff.value = settings.retry_backoff_seconds;
+  settingCacheDelay.value = settings.cache_probe_delay_seconds;
+}
 
-    function renderDetailTabs(item) {
+function inferProviderFamily(model) {
+  const normalized = String(model || "").toLowerCase();
+  if (normalized.includes("claude") || normalized.includes("sonnet")) return "anthropic";
+  return "gpt";
+}
+
+function renderDetailTabs(item) {
       const request = item.raw_response && (item.raw_response._request || item.raw_response.request);
       const response = stripInternalRequest(item.raw_response);
       const overview = {
@@ -378,7 +430,7 @@ const form = document.querySelector("#probeForm");
       `;
     }
 
-    function clientLabel(item) {
+function clientLabel(item) {
       const profile = item && item.metrics ? item.metrics.client_profile : null;
       const labels = {
         "codex-responses": "Codex",
@@ -389,7 +441,7 @@ const form = document.querySelector("#probeForm");
       return labels[profile] || profile || "客户端";
     }
 
-    function renderDetailBlock(title, value) {
+function renderDetailBlock(title, value) {
       return `
         <div class="detail-block">
           <h4>${escapeHtml(title)}</h4>
@@ -398,7 +450,7 @@ const form = document.querySelector("#probeForm");
       `;
     }
 
-    function stripInternalRequest(raw) {
+function stripInternalRequest(raw) {
       if (!raw || typeof raw !== "object") return raw;
       const cloned = JSON.parse(JSON.stringify(raw));
       delete cloned._request;
@@ -406,7 +458,7 @@ const form = document.querySelector("#probeForm");
       return cloned;
     }
 
-    function caseTitle(caseId) {
+function caseTitle(caseId) {
       const titles = {
         "metadata-basic-1": "接口元数据",
         "reasoning-math-1": "基础数学推理",
@@ -426,6 +478,8 @@ const form = document.querySelector("#probeForm");
         "tool-roundtrip-openai-1": "OpenAI 工具回合",
         "tool-roundtrip-anthropic-1": "Anthropic 工具回合",
         "stream-sse-basic-1": "SSE 流式输出",
+        "vision-image-suite-1": "图片理解综合测试",
+        "pdf-document-suite-1": "PDF 文档综合测试",
         "vision-image-color-1": "图片颜色识别",
         "vision-image-red-1": "红色图片与文字识别",
         "vision-image-green-1": "绿色图片与文字识别",
@@ -450,7 +504,7 @@ const form = document.querySelector("#probeForm");
       return titles[caseId] || caseId;
     }
 
-    function kindTitle(kind) {
+function kindTitle(kind) {
       const titles = {
         metadata: "协议",
         reasoning: "推理",
@@ -477,7 +531,7 @@ const form = document.querySelector("#probeForm");
       return titles[kind] || kind;
     }
 
-    function probeTitle(probe) {
+function probeTitle(probe) {
       const titles = {
         metadata: "接口元数据",
         combined_text: "基础能力综合",
@@ -505,7 +559,7 @@ const form = document.querySelector("#probeForm");
       return titles[probe] || probe;
     }
 
-    function riskTitle(risk) {
+function riskTitle(risk) {
       const titles = {
         normal: "正常",
         suspicious: "可疑",
@@ -515,7 +569,7 @@ const form = document.querySelector("#probeForm");
       return titles[risk] || risk || "-";
     }
 
-    function failureCategoryTitle(category) {
+function failureCategoryTitle(category) {
       const titles = {
         transport: "连接或传输问题",
         protocol: "协议或鉴权问题",
@@ -525,14 +579,14 @@ const form = document.querySelector("#probeForm");
       return titles[category] || category || null;
     }
 
-    function statusTitle(status) {
+function statusTitle(status) {
       if (status === "passed") return "通过";
       if (status === "failed") return "失败";
       if (status === "skipped") return "跳过";
       return status || "-";
     }
 
-    function buildConclusion(item) {
+function buildConclusion(item) {
       if (item.status === "skipped") {
         return `跳过：${skipReason(item)}`;
       }
@@ -542,7 +596,7 @@ const form = document.querySelector("#probeForm");
       return `失败：${failReason(item)}`;
     }
 
-    function passReason(item) {
+function passReason(item) {
       const reasons = {
         "metadata-basic-1": "返回了可解析内容，并包含模型、usage 和输出结构。",
         "reasoning-math-1": "算术推理结果正确。",
@@ -562,6 +616,8 @@ const form = document.querySelector("#probeForm");
         "tool-roundtrip-openai-1": "能理解 OpenAI 工具结果并继续回答。",
         "tool-roundtrip-anthropic-1": "能理解 Anthropic 工具结果并继续回答。",
         "stream-sse-basic-1": "返回了真实 SSE 流式事件，并记录了首 token 时间。",
+        "vision-image-suite-1": "多张图片的颜色和文字识别综合通过。",
+        "pdf-document-suite-1": "多个 PDF 文档标记识别综合通过。",
         "vision-image-color-1": "能识别内置测试图片的主色。",
         "vision-image-red-1": "能识别红色图片主色和可见文字。",
         "vision-image-green-1": "能识别绿色图片主色和可见文字。",
@@ -586,18 +642,18 @@ const form = document.querySelector("#probeForm");
       return reasons[item.case_id] || "结果满足该测试的判定条件。";
     }
 
-    function failReason(item) {
+function failReason(item) {
       const evidence = String(item.evidence || "").toLowerCase();
       if (evidence.includes("401 unauthorized")) return "鉴权失败，Key 无效或鉴权方式不匹配。";
       if (evidence.includes("403 forbidden")) return "权限不足，Key 没有访问该模型或接口的权限。";
       if (evidence.includes("model_not_found") || evidence.includes("no available channel for model")) {
-        return "模型不存在或当前账号组没有可用通道。";
+        return "模型不存在或当前账号组没有可用服务商配置。";
       }
       if (evidence.includes("upstream access forbidden")) {
         return "上游拒绝了该请求，通常是中转通道没有多模态权限或不支持当前 payload。";
       }
       if (evidence.includes("502 bad gateway")) {
-        return "上游通道返回 502，可能是中转不支持该能力或上游访问失败。";
+        return "上游返回 502，可能是不支持该能力或上游访问失败。";
       }
       if (evidence.includes("connecterror") || evidence.includes("getaddrinfo")) {
         return "连接失败，可能是域名解析、网络或目标服务不可达。";
@@ -622,7 +678,9 @@ const form = document.querySelector("#probeForm");
         "tool-call-required-1": "没有返回真实工具调用结构，可能只是自然语言模拟。",
         "tool-roundtrip-openai-1": "没有正确理解 OpenAI 工具结果。",
         "tool-roundtrip-anthropic-1": "没有正确理解 Anthropic 工具结果。",
-        "stream-sse-basic-1": "没有返回可用的 SSE 流式事件、文本或首 token 时间。",
+        "stream-sse-basic-1": "没有返回可用的流式事件、文本或首 token 时间。",
+        "vision-image-suite-1": "图片综合测试未通过，详情里包含每张图片的子项结果。",
+        "pdf-document-suite-1": "PDF 综合测试未通过，详情里包含每个 PDF 的子项结果。",
         "vision-image-color-1": "没有正确识别测试图片主色，或接口不支持图片输入。",
         "vision-image-red-1": "没有同时识别红色主色和图片文字，或接口不支持图片输入。",
         "vision-image-green-1": "没有同时识别绿色主色和图片文字，或接口不支持图片输入。",
@@ -647,7 +705,10 @@ const form = document.querySelector("#probeForm");
       return reasons[item.case_id] || "结果没有满足该测试的判定条件。";
     }
 
-    function skipReason(item) {
+function skipReason(item) {
+      if (item.skipped_reason && item.skipped_reason.includes("count_tokens")) {
+        return "该中转站没有提供兼容的可选 token 计数端点。";
+      }
       if (item.skipped_reason && item.skipped_reason.includes("not in supported profiles")) {
         return "当前协议形态不适用该测试。";
       }

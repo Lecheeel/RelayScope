@@ -39,6 +39,9 @@ class TargetConfig:
     client_profile: ClientProfile | None = None
     extra_headers: dict[str, str] = field(default_factory=dict)
     timeout_seconds: float = 60.0
+    max_retries: int = 2
+    retry_backoff_seconds: float = 0.8
+    cache_probe_delay_seconds: float = 1.2
     stream: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -70,6 +73,9 @@ def load_run_configs(path: str) -> list[RunConfig]:
             client_profile=client_profile,
             extra_headers=item.get("extra_headers", {}),
             timeout_seconds=float(item.get("timeout_seconds", 60.0)),
+            max_retries=int(item.get("max_retries", 2)),
+            retry_backoff_seconds=float(item.get("retry_backoff_seconds", 0.8)),
+            cache_probe_delay_seconds=float(item.get("cache_probe_delay_seconds", 1.2)),
             metadata=item.get("metadata", {}),
         )
         profiles = item.get("profiles")
@@ -86,6 +92,9 @@ def load_run_configs(path: str) -> list[RunConfig]:
                     client_profile=profile,
                     extra_headers=dict(target.extra_headers),
                     timeout_seconds=target.timeout_seconds,
+                    max_retries=target.max_retries,
+                    retry_backoff_seconds=target.retry_backoff_seconds,
+                    cache_probe_delay_seconds=target.cache_probe_delay_seconds,
                     metadata=dict(target.metadata),
                 )
                 run_configs.append(RunConfig(target=profiled, output_dir=output_dir))

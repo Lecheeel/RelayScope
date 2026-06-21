@@ -109,6 +109,8 @@ def run_probe(probe: Probe, client: ProviderClient) -> list[ProbeResult]:
                     "content_type": response.content_type,
                     "usage": response.usage,
                     "response_model": response.raw.get("model"),
+                    "retry_count": response.retries,
+                    "transient_failures": response.transient_failures or [],
                 }
             )
             results.append(result)

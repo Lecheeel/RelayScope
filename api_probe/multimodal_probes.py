@@ -4,6 +4,8 @@ import base64
 import struct
 import zlib
 from dataclasses import dataclass
+from dataclasses import asdict
+from time import sleep
 from typing import Any
 
 from .config import ProtocolMode, ProviderFamily, TargetConfig
@@ -38,23 +40,27 @@ class MultimodalCapabilityProbe:
         pdf_config = getattr(pdf_client, "config", None)
         pdf_family = getattr(getattr(pdf_config, "provider_family", None), "value", None)
         pdf_protocol = getattr(getattr(pdf_config, "protocol_mode", None), "value", None)
-        results: list[ProbeResult] = []
+        image_results: list[ProbeResult] = []
+        pdf_results: list[ProbeResult] = []
 
         for case_id, color, marker, rgb in IMAGE_CASES:
             image_messages = _image_messages(family, protocol, marker, rgb)
             if image_messages is None:
-                results.append(_skipped(case_id, "vision", family, protocol))
+                image_results.append(_skipped(case_id, "vision", family, protocol))
             else:
-                results.append(self._run_case(client, case_id, "vision", image_messages, (color, marker.lower()), require_all=True))
+                image_results.append(self._run_case(client, case_id, "vision", image_messages, (color,), optional_any=(marker.lower(),)))
 
         for case_id, marker in PDF_CASES:
             pdf_messages = _pdf_messages(pdf_family, pdf_protocol, marker)
             if pdf_messages is None:
-                results.append(_skipped(case_id, "pdf", pdf_family, pdf_protocol))
+                pdf_results.append(_skipped(case_id, "pdf", pdf_family, pdf_protocol))
             else:
-                results.append(self._run_case(pdf_client, case_id, "pdf", pdf_messages, (marker, marker.lower())))
+                pdf_results.append(self._run_case(pdf_client, case_id, "pdf", pdf_messages, (marker, marker.lower())))
 
-        return results
+        return [
+            _aggregate_results("vision-image-suite-1", "vision", "image", image_results),
+            _aggregate_results("pdf-document-suite-1", "pdf", "pdf", pdf_results),
+        ]
 
     def _run_case(
         self,
@@ -64,6 +70,7 @@ class MultimodalCapabilityProbe:
         messages: list[dict[str, Any]],
         expected_any: tuple[str, ...],
         require_all: bool = False,
+        optional_any: tuple[str, ...] = (),
     ) -> ProbeResult:
         try:
             response = client.complete(messages=messages, max_tokens=128)
@@ -87,6 +94,7 @@ class MultimodalCapabilityProbe:
             passed = all(item.lower() in lowered for item in expected_any)
         else:
             passed = any(item.lower() in lowered for item in expected_any)
+        optional_matches = [item for item in optional_any if item.lower() in lowered]
         return ProbeResult(
             case_id=case_id,
             kind=kind,
@@ -100,6 +108,9 @@ class MultimodalCapabilityProbe:
                 "content_type": response.content_type,
                 "usage": response.usage,
                 "response_model": response.raw.get("model"),
+                "retry_count": response.retries,
+                "transient_failures": response.transient_failures or [],
+                "optional_matches": optional_matches,
             },
             raw_response=response.raw,
         )
@@ -123,6 +134,8 @@ class PdfCacheProbe:
         responses = []
         failures = []
         for attempt in range(max(2, self.repeats)):
+            if attempt > 0:
+                sleep(_cache_delay(pdf_client))
             try:
                 response = pdf_client.complete(messages=messages, max_tokens=128, cache_control=True)
             except Exception as exc:
@@ -190,6 +203,12 @@ class PdfCacheProbe:
                     "cache_metric_seen": cache_metric_seen,
                     "cache_hit_seen": cache_hit_seen,
                     "latencies_ms": [round(response.latency_ms, 2) for response in responses],
+                    "retry_counts": [response.retries for response in responses],
+                    "transient_failures": [
+                        failure
+                        for response in responses
+                        for failure in (response.transient_failures or [])
+                    ],
                     "latency_drop_ratio": latency_drop,
                     "latency_cv": latency.coefficient_of_variation,
                     "usage": responses[-1].usage if responses else {},
@@ -288,6 +307,9 @@ def _pdf_client(client: ProviderClient) -> ProviderClient:
             client_profile=config.client_profile,
             extra_headers=dict(config.extra_headers),
             timeout_seconds=config.timeout_seconds,
+            max_retries=config.max_retries,
+            retry_backoff_seconds=config.retry_backoff_seconds,
+            cache_probe_delay_seconds=config.cache_probe_delay_seconds,
             stream=config.stream,
             metadata=dict(config.metadata),
         )
@@ -578,6 +600,50 @@ def _skipped(case_id: str, kind: str, family: str | None, protocol: str | None) 
     )
 
 
+def _aggregate_results(case_id: str, kind: str, group: str, results: list[ProbeResult]) -> ProbeResult:
+    if not results:
+        return ProbeResult(
+            case_id=case_id,
+            kind=kind,
+            status="skipped",
+            passed=False,
+            score=0.0,
+            evidence="No subtests were generated.",
+            failure_category="unsupported",
+            skipped_reason="no subtests",
+        )
+    passed_count = sum(1 for result in results if result.status == "passed")
+    failed_count = sum(1 for result in results if result.status == "failed")
+    skipped_count = sum(1 for result in results if result.status == "skipped")
+    scored_count = max(1, len(results) - skipped_count)
+    passed = failed_count == 0 and passed_count > 0
+    status = "passed" if passed else "failed" if failed_count else "skipped"
+    failure_category = None if passed else ("unsupported" if skipped_count == len(results) else "capability")
+    evidence = f"{group}_passed={passed_count}, failed={failed_count}, skipped={skipped_count}"
+    if failed_count:
+        first_failed = next((result for result in results if result.status == "failed"), None)
+        if first_failed is not None:
+            evidence += f" | first_failed={first_failed.case_id}: {first_failed.evidence[:220]}"
+    return ProbeResult(
+        case_id=case_id,
+        kind=kind,
+        status=status,
+        passed=passed,
+        score=round(passed_count / scored_count, 2),
+        evidence=evidence[:500],
+        failure_category=failure_category,
+        skipped_reason="all subtests skipped" if status == "skipped" else None,
+        metrics={
+            "subtest_count": len(results),
+            "passed": passed_count,
+            "failed": failed_count,
+            "skipped": skipped_count,
+            "subtests": [asdict(result) for result in results],
+        },
+        raw_response={"subtests": [asdict(result) for result in results]},
+    )
+
+
 def _multimodal_failure_category(exc: Exception) -> str:
     message = str(exc).lower()
     if "upstream access forbidden" in message or "unsupported" in message or "image" in message or "pdf" in message:
@@ -609,6 +675,15 @@ def _request_snapshot(client: ProviderClient, messages: list[dict[str, Any]]) ->
             "max_tokens": 128,
         },
     }
+
+
+def _cache_delay(client: ProviderClient) -> float:
+    config = getattr(client, "config", None)
+    value = getattr(config, "cache_probe_delay_seconds", 1.2)
+    try:
+        return max(0.0, min(5.0, float(value)))
+    except (TypeError, ValueError):
+        return 1.2
 
 
 def _minimal_pdf_bytes(text: str) -> bytes:

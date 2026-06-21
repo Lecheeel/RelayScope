@@ -62,6 +62,8 @@ class TokenCostAuditProbe:
                 max_reasonable_input_tokens=1500,
                 max_reasonable_output_tokens=128,
                 max_total_multiplier=12.0,
+                retry_count=response.retries,
+                transient_failures=response.transient_failures or [],
             ),
             _grade_token_audit(
                 "token-audit-hidden-prompt-1",
@@ -73,6 +75,8 @@ class TokenCostAuditProbe:
                 max_reasonable_input_tokens=1500,
                 max_reasonable_output_tokens=128,
                 max_total_multiplier=10.0,
+                retry_count=response.retries,
+                transient_failures=response.transient_failures or [],
             ),
         ]
 
@@ -170,6 +174,8 @@ def _grade_token_audit(
     max_reasonable_input_tokens: int,
     max_reasonable_output_tokens: int,
     max_total_multiplier: float,
+    retry_count: int = 0,
+    transient_failures: list[str] | None = None,
 ) -> ProbeResult:
     parsed = parse_usage(usage)
     input_present = isinstance(parsed.input_tokens, int) and parsed.input_tokens >= 1
@@ -208,6 +214,8 @@ def _grade_token_audit(
             "usage": usage,
             "batched": True,
             "response_preview": response_text[:300],
+            "retry_count": retry_count,
+            "transient_failures": transient_failures or [],
         },
         raw_response=raw,
     )

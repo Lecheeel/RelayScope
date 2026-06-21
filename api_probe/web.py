@@ -58,6 +58,12 @@ class ProbeRequestHandler(BaseHTTPRequestHandler):
         if parsed.path in {"/", "/index.html"}:
             self._send_static("index.html", "text/html; charset=utf-8")
             return
+        if parsed.path == "/advanced.html":
+            self._send_static("advanced.html", "text/html; charset=utf-8")
+            return
+        if parsed.path == "/settings":
+            self._send_static("advanced.html", "text/html; charset=utf-8")
+            return
         if parsed.path == "/styles.css":
             self._send_static("styles.css", "text/css; charset=utf-8")
             return
@@ -184,9 +190,14 @@ def build_web_targets(payload: dict[str, Any]) -> tuple[list[Any], str]:
     api_key = _required_string(payload, "api_key")
     model = _required_string(payload, "model")
     timeout = float(payload.get("timeout_seconds", 60))
-    profile = _optional_profile(payload.get("profile"))
-
-    target_profiles = [profile] if profile else ["codex-responses", "claude-code"]
+    max_retries = _max_retries(payload)
+    retry_backoff = _retry_backoff(payload)
+    cache_probe_delay = _cache_probe_delay(payload)
+    provider_family = _optional_provider_family(payload.get("provider_family", payload.get("channel")))
+    client_profile = _optional_client_profile(payload.get("client_profile", payload.get("profile")))
+    target_profiles = _target_profiles_for_provider(provider_family, client_profile)
+    if not target_profiles:
+        target_profiles = ["codex-responses"]
     targets = []
     for target_profile in target_profiles:
         model_config = _resolve_model_config(model, target_profile)
@@ -200,8 +211,45 @@ def build_web_targets(payload: dict[str, Any]) -> tuple[list[Any], str]:
             profile=model_config["profile"],
         )
         target.timeout_seconds = timeout
+        target.max_retries = max_retries
+        target.retry_backoff_seconds = retry_backoff
+        target.cache_probe_delay_seconds = cache_probe_delay
         targets.append(target)
     return targets, model
+
+
+def _optional_provider_family(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if not normalized or normalized == "auto":
+        return None
+    allowed = {"gpt", "anthropic"}
+    if normalized not in allowed:
+        raise ValueError(f"Unsupported provider family: {normalized}")
+    return normalized
+
+
+def _optional_client_profile(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or normalized == "auto":
+        return None
+    allowed = {"openai-chat", "codex-responses", "anthropic-messages", "claude-code"}
+    if normalized not in allowed:
+        raise ValueError(f"Unsupported client profile: {normalized}")
+    return normalized
+
+
+def _target_profiles_for_provider(provider_family: str | None, profile: str | None) -> list[str]:
+    if profile:
+        return [profile]
+    if provider_family == "anthropic":
+        return ["claude-code"]
+    if provider_family == "gpt":
+        return ["codex-responses"]
+    return ["codex-responses"]
 
 
 def run_targets_probes(targets: list[Any], job_id: str | None, *, max_concurrency: int = 1) -> list[Any]:
@@ -258,6 +306,8 @@ def run_target_probes(
         return results
 
     remaining = list(enumerate(probes[1:], start=1))
+    parallel_remaining = [(index, probe) for index, probe in remaining if not _is_cache_probe(probe)]
+    serial_remaining = [(index, probe) for index, probe in remaining if _is_cache_probe(probe)]
     if max_concurrency <= 1:
         for index, probe in remaining:
             if job_id is not None:
@@ -282,7 +332,7 @@ def run_target_probes(
     with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
         future_to_probe = {
             executor.submit(run_probe, probe, client): (index, probe)
-            for index, probe in remaining
+            for index, probe in parallel_remaining
         }
         for future in as_completed(future_to_probe):
             index, probe = future_to_probe[future]
@@ -303,7 +353,31 @@ def run_target_probes(
                     completed_results=len(results),
                     results=[asdict(result) for result in prior_results + results],
                 )
+    for index, probe in serial_remaining:
+        if job_id is not None:
+            _update_probe_job(job_id, current_probe=_probe_label(target, probe.name))
+        probe_results = run_probe(probe, client)
+        _tag_results(probe_results, target)
+        ordered_results[index] = probe_results
+        completed += 1
+        results = [
+            result
+            for result_index in sorted(ordered_results)
+            for result in ordered_results[result_index]
+        ]
+        if job_id is not None:
+            _update_probe_job(
+                job_id,
+                current_probe=_probe_label(target, probe.name),
+                completed_probes=completed_offset + completed,
+                completed_results=len(results),
+                results=[asdict(result) for result in prior_results + results],
+            )
     return results
+
+
+def _is_cache_probe(probe: Any) -> bool:
+    return getattr(probe, "name", "") in {"pdf_cache", "cache_integrity", "cache_nonce"}
 
 
 def build_probe_response(targets: list[Any], selected_model: str, summary: dict[str, Any], results: list[Any]) -> dict[str, Any]:
@@ -390,8 +464,13 @@ def fetch_model_names(payload: dict[str, Any]) -> dict[str, Any]:
     base_url = normalize_base_url(_required_string(payload, "base_url"))
     api_key = _required_string(payload, "api_key")
     selected_model = payload.get("model")
-    selected_profile = _optional_profile(payload.get("profile"))
-    provider = _provider_for_profile(selected_profile) or (_provider_for_model(selected_model) if isinstance(selected_model, str) else "openai")
+    selected_profile = _optional_client_profile(payload.get("client_profile", payload.get("profile")))
+    selected_provider_family = _optional_provider_family(payload.get("provider_family", payload.get("channel")))
+    provider = (
+        _provider_for_profile(selected_profile)
+        or _provider_for_provider_family(selected_provider_family)
+        or (_provider_for_model(selected_model) if isinstance(selected_model, str) else "openai")
+    )
     attempts = [provider, "anthropic" if provider == "openai" else "openai"]
     last_error = ""
 
@@ -540,6 +619,30 @@ def _max_concurrency(payload: dict[str, Any]) -> int:
     return max(1, min(8, value))
 
 
+def _max_retries(payload: dict[str, Any]) -> int:
+    try:
+        value = int(payload.get("max_retries", 2))
+    except (TypeError, ValueError):
+        value = 2
+    return max(0, min(5, value))
+
+
+def _retry_backoff(payload: dict[str, Any]) -> float:
+    try:
+        value = float(payload.get("retry_backoff_seconds", 0.8))
+    except (TypeError, ValueError):
+        value = 0.8
+    return max(0.1, min(5.0, value))
+
+
+def _cache_probe_delay(payload: dict[str, Any]) -> float:
+    try:
+        value = float(payload.get("cache_probe_delay_seconds", 1.2))
+    except (TypeError, ValueError):
+        value = 1.2
+    return max(0.0, min(5.0, value))
+
+
 def _resolve_model_config(model: str, profile: str | None = None) -> dict[str, str]:
     known = MODEL_OPTIONS.get(model)
     if known is not None and profile is None:
@@ -552,22 +655,18 @@ def _resolve_model_config(model: str, profile: str | None = None) -> dict[str, s
     }
 
 
-def _optional_profile(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-    normalized = value.strip()
-    if not normalized or normalized == "auto":
-        return None
-    allowed = {"openai-chat", "codex-responses", "anthropic-messages", "claude-code"}
-    if normalized not in allowed:
-        raise ValueError(f"Unsupported client profile: {normalized}")
-    return normalized
-
-
 def _provider_for_profile(profile: str | None) -> str | None:
     if profile in {"openai-chat", "codex-responses"}:
         return "openai"
     if profile in {"anthropic-messages", "claude-code"}:
+        return "anthropic"
+    return None
+
+
+def _provider_for_provider_family(provider_family: str | None) -> str | None:
+    if provider_family == "gpt":
+        return "openai"
+    if provider_family == "anthropic":
         return "anthropic"
     return None
 

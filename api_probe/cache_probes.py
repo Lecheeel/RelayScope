@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import sleep
 from typing import Any
 
 from .models import ProbeCase, ProbeResult
@@ -39,6 +40,8 @@ class CacheIntegrityProbe:
         responses = []
         failures = []
         for attempt in range(max(2, case.repeat)):
+            if attempt > 0:
+                sleep(_cache_delay(client))
             try:
                 response = client.complete(case.prompt, **case.request_options)
             except Exception as exc:
@@ -103,6 +106,12 @@ class CacheIntegrityProbe:
                     "cache_metric_seen": cache_metric_seen,
                     "cache_hit_seen": cache_hit_seen,
                     "latencies_ms": [round(response.latency_ms, 2) for response in responses],
+                    "retry_counts": [response.retries for response in responses],
+                    "transient_failures": [
+                        failure
+                        for response in responses
+                        for failure in (response.transient_failures or [])
+                    ],
                     "latency_drop_ratio": latency_drop,
                     "latency_cv": latency.coefficient_of_variation,
                     "usage": responses[-1].usage if responses else {},
@@ -178,3 +187,12 @@ def _request_snapshot(client: ProviderClient, prompt: str, request_options: dict
             **request_options,
         },
     }
+
+
+def _cache_delay(client: ProviderClient) -> float:
+    config = getattr(client, "config", None)
+    value = getattr(config, "cache_probe_delay_seconds", 1.2)
+    try:
+        return max(0.0, min(5.0, float(value)))
+    except (TypeError, ValueError):
+        return 1.2

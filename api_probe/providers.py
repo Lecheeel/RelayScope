@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from urllib.parse import urlparse
 from time import perf_counter
+from time import sleep
 from typing import Any, Protocol
 import json
 import uuid
@@ -20,6 +21,8 @@ class ProviderResponse:
     latency_ms: float
     content_type: str = ""
     request: dict[str, Any] | None = None
+    retries: int = 0
+    transient_failures: list[str] | None = None
 
 
 @dataclass(slots=True)
@@ -32,6 +35,8 @@ class ProviderStreamResponse:
     chunk_count: int
     content_type: str = ""
     request: dict[str, Any] | None = None
+    retries: int = 0
+    transient_failures: list[str] | None = None
 
 
 class ProviderClient(Protocol):
@@ -97,9 +102,7 @@ class OpenAICompatibleClient:
         }
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         started = perf_counter()
-        with httpx.Client(timeout=self.config.timeout_seconds) as client:
-            response = client.post(url, headers=headers, json=payload)
-            _raise_for_status(response)
+        response, retry_info = _post_json_with_retries(self.config, url, headers, payload)
         latency_ms = (perf_counter() - started) * 1000
         raw = _json_or_error(response)
         raw["_response_headers"] = dict(response.headers)
@@ -113,6 +116,8 @@ class OpenAICompatibleClient:
             latency_ms=latency_ms,
             content_type=response.headers.get("content-type", ""),
             request=request_info,
+            retries=retry_info["retries"],
+            transient_failures=retry_info["transient_failures"],
         )
 
     def stream_complete(
@@ -143,6 +148,7 @@ class OpenAICompatibleClient:
         events: list[dict[str, Any]] = []
         usage: dict[str, Any] = {}
         content_type = ""
+        retry_info = {"retries": 0, "transient_failures": []}
         with httpx.Client(timeout=self.config.timeout_seconds) as client:
             with client.stream("POST", url, headers=headers, json=payload) as response:
                 _raise_for_status(response)
@@ -169,6 +175,8 @@ class OpenAICompatibleClient:
             chunk_count=len(events),
             content_type=content_type,
             request=request_info,
+            retries=retry_info["retries"],
+            transient_failures=retry_info["transient_failures"],
         )
 
 
@@ -209,9 +217,7 @@ class OpenAIResponsesClient:
         }
         url = self.config.base_url.rstrip("/") + "/responses"
         started = perf_counter()
-        with httpx.Client(timeout=self.config.timeout_seconds) as client:
-            response = client.post(url, headers=headers, json=payload)
-            _raise_for_status(response)
+        response, retry_info = _post_json_with_retries(self.config, url, headers, payload)
         latency_ms = (perf_counter() - started) * 1000
         raw = _json_or_error(response)
         raw["_response_headers"] = dict(response.headers)
@@ -225,6 +231,8 @@ class OpenAIResponsesClient:
             latency_ms=latency_ms,
             content_type=response.headers.get("content-type", ""),
             request=request_info,
+            retries=retry_info["retries"],
+            transient_failures=retry_info["transient_failures"],
         )
 
     def stream_complete(
@@ -320,15 +328,13 @@ class AnthropicClient:
         if self.config.client_profile == ClientProfile.CLAUDE_CODE:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
             headers["User-Agent"] = "api-probe claude-code profile"
-            headers.setdefault("X-Claude-Code-Session-Id", str(uuid.uuid4()))
-            headers.setdefault("X-Claude-Code-Agent-Id", str(uuid.uuid4()))
+            headers.setdefault("X-Claude-Code-Session-Id", self.config.metadata.setdefault("claude_code_session_id", str(uuid.uuid4())))
+            headers.setdefault("X-Claude-Code-Agent-Id", self.config.metadata.setdefault("claude_code_agent_id", str(uuid.uuid4())))
         else:
             headers["x-api-key"] = self.config.api_key
         url = self.config.base_url.rstrip("/") + "/messages"
         started = perf_counter()
-        with httpx.Client(timeout=self.config.timeout_seconds) as client:
-            response = client.post(url, headers=headers, json=payload)
-            _raise_for_status(response)
+        response, retry_info = _post_json_with_retries(self.config, url, headers, payload)
         latency_ms = (perf_counter() - started) * 1000
         raw = _json_or_error(response)
         raw["_response_headers"] = dict(response.headers)
@@ -346,6 +352,8 @@ class AnthropicClient:
             latency_ms=latency_ms,
             content_type=response.headers.get("content-type", ""),
             request=request_info,
+            retries=retry_info["retries"],
+            transient_failures=retry_info["transient_failures"],
         )
 
     def stream_complete(
@@ -371,8 +379,8 @@ class AnthropicClient:
         if self.config.client_profile == ClientProfile.CLAUDE_CODE:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
             headers["User-Agent"] = "api-probe claude-code profile"
-            headers.setdefault("X-Claude-Code-Session-Id", str(uuid.uuid4()))
-            headers.setdefault("X-Claude-Code-Agent-Id", str(uuid.uuid4()))
+            headers.setdefault("X-Claude-Code-Session-Id", self.config.metadata.setdefault("claude_code_session_id", str(uuid.uuid4())))
+            headers.setdefault("X-Claude-Code-Agent-Id", self.config.metadata.setdefault("claude_code_agent_id", str(uuid.uuid4())))
         else:
             headers["x-api-key"] = self.config.api_key
         url = self.config.base_url.rstrip("/") + "/messages"
@@ -394,6 +402,8 @@ class AnthropicClient:
                         usage.update(event["message"]["usage"])
                     delta = event.get("delta", {})
                     text = delta.get("text") if isinstance(delta, dict) else None
+                    if text is None and isinstance(event.get("content_block"), dict):
+                        text = event["content_block"].get("text")
                     if isinstance(text, str) and text:
                         if first_token_ms is None:
                             first_token_ms = (perf_counter() - started) * 1000
@@ -449,6 +459,62 @@ def _raise_for_status(response: httpx.Response) -> None:
             request=exc.request,
             response=exc.response,
         ) from exc
+
+
+def _post_json_with_retries(
+    config: TargetConfig,
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+) -> tuple[httpx.Response, dict[str, Any]]:
+    failures: list[str] = []
+    max_retries = max(0, int(getattr(config, "max_retries", 2)))
+    backoff = max(0.0, float(getattr(config, "retry_backoff_seconds", 0.8)))
+    for attempt in range(max_retries + 1):
+        try:
+            with httpx.Client(timeout=config.timeout_seconds) as client:
+                response = client.post(url, headers=headers, json=payload)
+                _raise_for_status(response)
+                return response, {"retries": attempt, "transient_failures": failures}
+        except Exception as exc:
+            if not _is_retryable_exception(exc) or attempt >= max_retries:
+                raise
+            failures.append(f"{type(exc).__name__}: {str(exc)[:300]}")
+            sleep(backoff * (2 ** attempt))
+    raise RuntimeError("unreachable retry state")
+
+
+def _is_retryable_exception(exc: Exception) -> bool:
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.PoolTimeout)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status in {408, 429, 500, 502, 503, 504}:
+            return True
+        return False
+    message = str(exc).lower()
+    retry_markers = (
+        "connection reset",
+        "connection aborted",
+        "temporarily unavailable",
+        "timed out",
+        "timeout",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "remote protocol",
+    )
+    non_retry_markers = (
+        "401",
+        "403",
+        "model_not_found",
+        "no available channel for model",
+        "invalid_request",
+        "unsupported",
+    )
+    if any(marker in message for marker in non_retry_markers):
+        return False
+    return any(marker in message for marker in retry_markers)
 
 
 def _request_info(method: str, url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
@@ -612,8 +678,19 @@ def _anthropic_messages(messages: list[dict[str, Any]], *, cache_control: bool =
                     ],
                 }
             )
+        elif cache_control and index == last_index and role == "user" and isinstance(content, list):
+            normalized.append({"role": role, "content": _with_anthropic_cache_control(content)})
         elif isinstance(content, str):
             normalized.append({"role": role, "content": content})
         else:
             normalized.append({"role": role, "content": content})
     return normalized
+
+
+def _with_anthropic_cache_control(content: list[Any]) -> list[Any]:
+    copied = [dict(part) if isinstance(part, dict) else part for part in content]
+    for part in reversed(copied):
+        if isinstance(part, dict) and part.get("type") in {"text", "document", "image"}:
+            part.setdefault("cache_control", {"type": "ephemeral"})
+            break
+    return copied
