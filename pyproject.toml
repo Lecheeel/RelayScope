@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "api-probe"
 version = "0.1.0"
-description = "检测 / audit LLM relay compatibility, identity, cache, usage, and billing behavior"
+description = "识别掺水 LLM 中转、假模型、降质模型、缓存倍率和可疑计费 / Detect watered-down LLM relays, fake models, cache multipliers, and billing risk"
 requires-python = ">=3.11"
 dependencies = [
   "httpx>=0.27",
