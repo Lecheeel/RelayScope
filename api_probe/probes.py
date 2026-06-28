@@ -7,6 +7,7 @@ from typing import Any, Protocol
 
 from .models import ProbeCase, ProbeResult
 from .providers import ProviderClient
+from .debug_tools import log_debug_event
 
 
 OPENAI_AGENT_PROFILES = ("openai-chat", "codex-responses")
@@ -52,10 +53,23 @@ class SimpleEchoProbe:
 def run_probe(probe: Probe, client: ProviderClient) -> list[ProbeResult]:
     custom_run = getattr(probe, "run", None)
     if callable(custom_run):
-        return custom_run(client)
+        client_config = getattr(client, "config", None)
+        log_debug_event(client_config, "probe.start", {"probe": getattr(probe, "name", None), "custom_run": True})
+        results = custom_run(client)
+        log_debug_event(
+            client_config,
+            "probe.finish",
+            {
+                "probe": getattr(probe, "name", None),
+                "custom_run": True,
+                "results": [_result_snapshot(result) for result in results],
+            },
+        )
+        return results
 
     results: list[ProbeResult] = []
     client_config = getattr(client, "config", None)
+    log_debug_event(client_config, "probe.start", {"probe": getattr(probe, "name", None), "custom_run": False})
     for case in probe.cases():
         supported_profiles = case.metadata.get("profiles")
         if supported_profiles and client_config is not None:
@@ -76,9 +90,19 @@ def run_probe(probe: Probe, client: ProviderClient) -> list[ProbeResult]:
                         ),
                     )
                 )
+                log_debug_event(
+                    client_config,
+                    "probe.case.skipped",
+                    {"probe": getattr(probe, "name", None), "case_id": case.id, "kind": case.kind},
+                )
                 continue
         repeat_count = max(1, case.repeat)
         for attempt in range(repeat_count):
+            log_debug_event(
+                client_config,
+                "probe.case.start",
+                {"probe": getattr(probe, "name", None), "case_id": case.id, "kind": case.kind, "attempt": attempt + 1},
+            )
             try:
                 response = client.complete(
                     case.prompt,
@@ -99,6 +123,17 @@ def run_probe(probe: Probe, client: ProviderClient) -> list[ProbeResult]:
                         metrics={"attempt": attempt + 1, "error_type": type(exc).__name__},
                     )
                 )
+                log_debug_event(
+                    client_config,
+                    "probe.case.error",
+                    {
+                        "probe": getattr(probe, "name", None),
+                        "case_id": case.id,
+                        "kind": case.kind,
+                        "attempt": attempt + 1,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
                 continue
             result = probe.grade(case, response.text, response.raw)
             result.status = "passed" if result.passed else "failed"
@@ -114,7 +149,36 @@ def run_probe(probe: Probe, client: ProviderClient) -> list[ProbeResult]:
                 }
             )
             results.append(result)
+            log_debug_event(
+                client_config,
+                "probe.case.finish",
+                {
+                    "probe": getattr(probe, "name", None),
+                    "case_id": case.id,
+                    "kind": case.kind,
+                    "attempt": attempt + 1,
+                    "result": _result_snapshot(result),
+                },
+            )
+    log_debug_event(
+        client_config,
+        "probe.finish",
+        {"probe": getattr(probe, "name", None), "custom_run": False, "results": [_result_snapshot(result) for result in results]},
+    )
     return results
+
+
+def _result_snapshot(result: ProbeResult) -> dict[str, Any]:
+    return {
+        "case_id": result.case_id,
+        "kind": result.kind,
+        "status": result.status,
+        "passed": result.passed,
+        "score": result.score,
+        "failure_category": result.failure_category,
+        "evidence": result.evidence[:500],
+        "metrics": result.metrics,
+    }
 
 
 @dataclass(slots=True)

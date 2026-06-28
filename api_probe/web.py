@@ -5,9 +5,11 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -15,7 +17,8 @@ import httpx
 
 from .cli import build_default_target, build_probes
 from .config import normalize_base_url
-from .providers import build_client
+from .debug_tools import log_debug_event
+from .providers import CLAUDE_CODE_BETA, CLAUDE_CODE_USER_AGENT, build_client
 from .probes import run_probe
 from .usage_metrics import LatencyStats, has_cache_metric, parse_usage
 
@@ -142,10 +145,12 @@ class ProbeRequestHandler(BaseHTTPRequestHandler):
 def run_web_probe(payload: dict[str, Any]) -> dict[str, Any]:
     targets, selected_model = build_web_targets(payload)
     max_concurrency = _max_concurrency(payload)
+    _configure_debug_targets(targets, payload, None)
     results = run_targets_probes(targets, None, max_concurrency=max_concurrency)
     summary = summarize_web_results(results)
     summary["stop_reason"] = _stop_reason(results)
     summary["stopped_early"] = summary["stop_reason"] is not None
+    summary["debug"] = _debug_summary(targets)
     return build_probe_response(targets, selected_model, summary, results)
 
 
@@ -155,6 +160,7 @@ def start_probe_job(payload: dict[str, Any]) -> dict[str, Any]:
     probes = build_probes()
     total_probes = len(probes) * len(targets)
     job_id = uuid.uuid4().hex
+    _configure_debug_targets(targets, payload, job_id)
     job = {
         "job_id": job_id,
         "status": "running",
@@ -168,7 +174,11 @@ def start_probe_job(payload: dict[str, Any]) -> dict[str, Any]:
         "summary": None,
         "results": [],
         "error": None,
-        "settings": {"max_concurrency": max_concurrency, "timeout_seconds": targets[0].timeout_seconds},
+        "settings": {
+            "max_concurrency": max_concurrency,
+            "timeout_seconds": targets[0].timeout_seconds,
+            "debug": _debug_summary(targets),
+        },
     }
     with JOBS_LOCK:
         JOBS[job_id] = job
@@ -216,6 +226,52 @@ def build_web_targets(payload: dict[str, Any]) -> tuple[list[Any], str]:
         target.cache_probe_delay_seconds = cache_probe_delay
         targets.append(target)
     return targets, model
+
+
+def _configure_debug_targets(targets: list[Any], payload: dict[str, Any], job_id: str | None) -> None:
+    enabled = _debug_enabled(payload)
+    log_path = _debug_log_path(payload, job_id) if enabled else None
+    for target in targets:
+        target.metadata["debug_mode"] = enabled
+        if log_path is not None:
+            target.metadata["debug_log_path"] = str(log_path)
+        log_debug_event(
+            target,
+            "probe.job.target_configured",
+            {
+                "job_id": job_id,
+                "debug_enabled": enabled,
+                "debug_log_path": str(log_path) if log_path is not None else None,
+                "timeout_seconds": target.timeout_seconds,
+                "max_retries": target.max_retries,
+                "retry_backoff_seconds": target.retry_backoff_seconds,
+                "cache_probe_delay_seconds": target.cache_probe_delay_seconds,
+            },
+        )
+
+
+def _debug_enabled(payload: dict[str, Any]) -> bool:
+    value = payload.get("debug_mode")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _debug_log_path(payload: dict[str, Any], job_id: str | None) -> Path:
+    provided = payload.get("debug_log_path")
+    if isinstance(provided, str) and provided.strip():
+        return Path(provided.strip())
+    suffix = job_id or datetime.now().strftime("%Y%m%d-%H%M%S")
+    return Path("runs") / f"debug-{suffix}.jsonl"
+
+
+def _debug_summary(targets: list[Any]) -> dict[str, Any]:
+    if not targets:
+        return {"enabled": False, "log_path": None}
+    enabled = bool(targets[0].metadata.get("debug_mode"))
+    return {"enabled": enabled, "log_path": targets[0].metadata.get("debug_log_path")}
 
 
 def _optional_provider_family(value: Any) -> str | None:
@@ -282,10 +338,12 @@ def run_target_probes(
     prior_results: list[Any] | None = None,
 ) -> list[Any]:
     client = build_client(target)
+    log_debug_event(target, "probe.target.start", {"job_id": job_id, "max_concurrency": max_concurrency})
     prior_results = prior_results or []
     results = []
     probes = build_probes()
     if not probes:
+        log_debug_event(target, "probe.target.finish", {"result_count": 0})
         return results
 
     first_probe = probes[0]
@@ -303,6 +361,7 @@ def run_target_probes(
             results=[asdict(result) for result in prior_results + results],
         )
     if _should_stop_early(results) or _should_stop_after_probe(first_results):
+        log_debug_event(target, "probe.target.finish", {"result_count": len(results), "stopped_after_first": True})
         return results
 
     remaining = list(enumerate(probes[1:], start=1))
@@ -325,6 +384,7 @@ def run_target_probes(
                 )
             if _should_stop_early(results) or _should_stop_after_probe(probe_results):
                 break
+        log_debug_event(target, "probe.target.finish", {"result_count": len(results), "max_concurrency": max_concurrency})
         return results
 
     ordered_results: dict[int, list[Any]] = {0: first_results}
@@ -373,6 +433,7 @@ def run_target_probes(
                 completed_results=len(results),
                 results=[asdict(result) for result in prior_results + results],
             )
+    log_debug_event(target, "probe.target.finish", {"result_count": len(results), "max_concurrency": max_concurrency})
     return results
 
 
@@ -391,10 +452,15 @@ def build_probe_response(targets: list[Any], selected_model: str, summary: dict[
 def _run_probe_job(job_id: str, targets: list[Any], selected_model: str, probes: list[Any], max_concurrency: int) -> None:
     try:
         _ = probes
+        for target in targets:
+            log_debug_event(target, "probe.job.start", {"job_id": job_id, "selected_model": selected_model})
         results = run_targets_probes(targets, job_id, max_concurrency=max_concurrency)
         summary = summarize_web_results(results)
         summary["stop_reason"] = _stop_reason(results)
         summary["stopped_early"] = summary["stop_reason"] is not None
+        summary["debug"] = _debug_summary(targets)
+        for target in targets:
+            log_debug_event(target, "probe.job.finish", {"job_id": job_id, "summary": summary})
         with JOBS_LOCK:
             JOBS[job_id].update(
                 {
@@ -405,6 +471,8 @@ def _run_probe_job(job_id: str, targets: list[Any], selected_model: str, probes:
                 }
             )
     except Exception as exc:
+        for target in targets:
+            log_debug_event(target, "probe.job.error", {"job_id": job_id, "error": f"{type(exc).__name__}: {exc}"})
         with JOBS_LOCK:
             JOBS[job_id].update({"status": "failed", "error": f"{type(exc).__name__}: {exc}"})
 
@@ -473,6 +541,12 @@ def fetch_model_names(payload: dict[str, Any]) -> dict[str, Any]:
     )
     attempts = [provider, "anthropic" if provider == "openai" else "openai"]
     last_error = ""
+    debug_config = None
+    if _debug_enabled(payload):
+        debug_target, _ = build_web_targets({**payload, "model": selected_model or "model-list"})
+        _configure_debug_targets(debug_target, payload, None)
+        debug_config = debug_target[0]
+        log_debug_event(debug_config, "models.fetch.start", {"base_url": base_url, "provider_attempts": attempts})
 
     for attempt_provider in attempts:
         url = base_url.rstrip("/") + "/models"
@@ -482,16 +556,25 @@ def fetch_model_names(payload: dict[str, Any]) -> dict[str, Any]:
                 response = client.get(url, headers=headers)
             if response.status_code >= 400:
                 last_error = _http_error_preview(response)
+                log_debug_event(
+                    debug_config,
+                    "models.fetch.http_error",
+                    {"provider": attempt_provider, "url": url, "status_code": response.status_code, "preview": response.text[:500]},
+                )
                 continue
             data = response.json()
         except (httpx.HTTPError, ValueError) as exc:
             last_error = f"{type(exc).__name__}: {exc}"
+            log_debug_event(debug_config, "models.fetch.error", {"provider": attempt_provider, "url": url, "error": last_error})
             continue
         models = _extract_model_names(data)
         if models:
+            log_debug_event(debug_config, "models.fetch.finish", {"provider": attempt_provider, "url": url, "model_count": len(models)})
             return {"base_url": base_url, "provider": attempt_provider, "models": models}
         last_error = "Model list response did not contain any model ids."
+        log_debug_event(debug_config, "models.fetch.empty", {"provider": attempt_provider, "url": url})
 
+    log_debug_event(debug_config, "models.fetch.failed", {"error": last_error})
     raise ValueError(f"Unable to fetch model list. {last_error}")
 
 
@@ -545,6 +628,11 @@ def summarize_web_results(results: list[Any]) -> dict[str, Any]:
     cache_relevant_results = [result for result in results if result.kind == "cache" or "cache" in result.case_id]
     usage_source = cache_relevant_results or results
     cache_input_tokens = 0
+    blackbox_cache_source = [result for result in cache_relevant_results if _has_blackbox_cache_signal(result)]
+    blackbox_input_tokens = 0
+    blackbox_estimated_tokens = 0
+    blackbox_samples = 0
+    blackbox_supporting_samples = 0
     for result in usage_source:
         usage = result.metrics.get("usage")
         if not isinstance(usage, dict):
@@ -561,11 +649,43 @@ def summarize_web_results(results: list[Any]) -> dict[str, Any]:
             cache_samples += 1
             if has_cache:
                 cache_metric_samples += 1
+    for result in blackbox_cache_source:
+        usage = result.metrics.get("usage")
+        if isinstance(usage, dict):
+            parsed_usage = parse_usage(usage)
+            if isinstance(parsed_usage.input_tokens, int):
+                blackbox_input_tokens += parsed_usage.input_tokens
+            blackbox_estimated_tokens += _estimate_blackbox_cached_tokens(result)
+            blackbox_samples += 1
+            if _has_blackbox_cache_support(result):
+                blackbox_supporting_samples += 1
 
     cache_hit_rate = None
     cache_total_tokens = cache_input_tokens + cached_tokens + cache_creation_tokens
     if cache_total_tokens > 0 and cache_metric_samples > 0:
-        cache_hit_rate = round((cached_tokens / cache_total_tokens) * 100, 2)
+        cache_hit_rate = round((cached_tokens / cache_input_tokens) * 100, 2) if cache_input_tokens > 0 else None
+    cache_usage_status = _cache_usage_status(cache_samples, cache_metric_samples)
+    blackbox_cache_hit_rate = None
+    if blackbox_samples > 0 and blackbox_supporting_samples > 0 and blackbox_input_tokens > 0:
+        blackbox_cache_hit_rate = round((blackbox_estimated_tokens / blackbox_input_tokens) * 100, 2)
+    cache_observation_mode = _cache_observation_mode(cache_usage_status, blackbox_cache_hit_rate)
+    precise_cache_sample_count = cache_samples
+    cache_groups = {
+        "precise": {
+            "available": cache_usage_status in {"reported", "partial"},
+            "status": cache_usage_status,
+            "hit_rate": cache_hit_rate,
+            "sample_count": precise_cache_sample_count,
+            "metric_sample_count": cache_metric_samples,
+        },
+        "blackbox": {
+            "available": blackbox_cache_hit_rate is not None,
+            "status": "estimated" if blackbox_cache_hit_rate is not None else "unavailable",
+            "hit_rate": blackbox_cache_hit_rate,
+            "sample_count": blackbox_samples,
+            "support_count": blackbox_supporting_samples,
+        },
+    }
     reference_tokens = input_tokens + output_tokens
     weighted_tokens = input_tokens + (output_tokens * 3) + reasoning_tokens
     effective_total_tokens = total_tokens if total_tokens > 0 else reference_tokens + reasoning_tokens
@@ -589,6 +709,12 @@ def summarize_web_results(results: list[Any]) -> dict[str, Any]:
         "latency_variation": latency_variation,
         "tokens_per_second": tokens_per_second,
         "cache_hit_rate": cache_hit_rate,
+        "blackbox_cache_hit_rate": blackbox_cache_hit_rate,
+        "cache_usage_status": cache_usage_status,
+        "cache_observation_mode": cache_observation_mode,
+        "cache_groups": cache_groups,
+        "cache_usage_note": _cache_usage_note(cache_usage_status),
+        "blackbox_cache_note": _blackbox_cache_note(cache_observation_mode),
         "cached_tokens": cached_tokens if cache_samples else None,
         "cache_creation_tokens": cache_creation_tokens if cache_samples else None,
         "input_tokens": input_tokens if usage_samples else None,
@@ -596,12 +722,92 @@ def summarize_web_results(results: list[Any]) -> dict[str, Any]:
         "reasoning_tokens": reasoning_tokens if usage_samples else None,
         "total_tokens": effective_total_tokens if usage_samples else None,
         "cache_input_tokens": cache_input_tokens if cache_samples else None,
+        "blackbox_cache_input_tokens": blackbox_input_tokens if blackbox_samples else None,
+        "blackbox_cached_tokens": blackbox_estimated_tokens if blackbox_samples else None,
         "reference_tokens": reference_tokens if usage_samples else None,
         "weighted_tokens": weighted_tokens if usage_samples else None,
         "composite_multiplier": composite_multiplier,
         "cache_sample_count": cache_samples,
         "cache_metric_sample_count": cache_metric_samples,
+        "blackbox_cache_sample_count": blackbox_samples,
+        "blackbox_cache_support_count": blackbox_supporting_samples,
     }
+
+
+def _cache_usage_status(cache_samples: int, cache_metric_samples: int) -> str:
+    if cache_samples <= 0:
+        return "no_usage_samples"
+    if cache_metric_samples <= 0:
+        return "not_reported"
+    if cache_metric_samples < cache_samples:
+        return "partial"
+    return "reported"
+
+
+def _cache_usage_note(status: str) -> str:
+    notes = {
+        "reported": "服务商返回了可计算的缓存 usage 字段。",
+        "partial": "部分缓存请求返回了缓存 usage 字段，命中率只按这些可见字段计算。",
+        "not_reported": "服务商没有透传可计算的缓存读写 token；缓存命中率无法从 usage 精确计算。",
+        "no_usage_samples": "本次没有可用的缓存 usage 样本。",
+    }
+    return notes.get(status, notes["no_usage_samples"])
+
+
+def _cache_observation_mode(cache_usage_status: str, blackbox_cache_hit_rate: float | None) -> str:
+    if cache_usage_status in {"reported", "partial"}:
+        return "precise"
+    if blackbox_cache_hit_rate is not None:
+        return "blackbox"
+    return "unknown"
+
+
+def _blackbox_cache_note(mode: str) -> str:
+    notes = {
+        "precise": "服务商返回了可计算的缓存读写 token，优先使用 usage 字段。",
+        "blackbox": "服务商未透传缓存 usage，已回落到延迟与重复请求行为的黑盒推断。",
+        "unknown": "既没有缓存 usage 字段，也没有足够的黑盒证据。",
+    }
+    return notes.get(mode, notes["unknown"])
+
+
+def _has_blackbox_cache_signal(result: Any) -> bool:
+    if result.kind != "cache":
+        return False
+    if result.status == "skipped":
+        return False
+    metrics = result.metrics or {}
+    if isinstance(metrics.get("cache_hit_seen"), bool) and metrics["cache_hit_seen"]:
+        return True
+    latency_drop = metrics.get("latency_drop_ratio")
+    if isinstance(latency_drop, (int, float)) and latency_drop >= 0.10:
+        return True
+    return bool(metrics.get("cache_strength", 0) >= 0.55)
+
+
+def _has_blackbox_cache_support(result: Any) -> bool:
+    metrics = result.metrics or {}
+    latency_drop = metrics.get("latency_drop_ratio")
+    if isinstance(latency_drop, (int, float)) and latency_drop >= 0.10:
+        return True
+    return bool(metrics.get("cache_hit_seen"))
+
+
+def _estimate_blackbox_cached_tokens(result: Any) -> int:
+    metrics = result.metrics or {}
+    latencies = metrics.get("latencies_ms")
+    if isinstance(latencies, list) and len(latencies) > 1:
+        first = latencies[0]
+        rest = [value for value in latencies[1:] if isinstance(value, (int, float))]
+        if isinstance(first, (int, float)) and rest:
+            drop = max(0.0, first - (sum(rest) / len(rest)))
+            estimated = int(round(drop / max(1.0, first) * 1000))
+            return max(0, estimated)
+    if bool(metrics.get("cache_hit_seen")):
+        cached_values = metrics.get("cached_values")
+        if isinstance(cached_values, list):
+            return sum(value for value in cached_values if isinstance(value, int) and value > 0)
+    return 0
 
 
 def _required_string(payload: dict[str, Any], key: str) -> str:
@@ -685,7 +891,9 @@ def _model_list_headers(provider: str, api_key: str, profile: str | None = None)
                 "Authorization": f"Bearer {api_key}",
                 "anthropic-version": "2023-06-01",
                 "Content-Type": "application/json",
-                "User-Agent": "api-probe claude-code profile",
+                "User-Agent": CLAUDE_CODE_USER_AGENT,
+                "x-app": "cli",
+                "anthropic-beta": CLAUDE_CODE_BETA,
             }
         return {
             "x-api-key": api_key,

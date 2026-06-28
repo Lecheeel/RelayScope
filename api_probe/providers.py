@@ -11,6 +11,10 @@ import uuid
 import httpx
 
 from .config import ClientProfile, ProtocolMode, TargetConfig
+from .debug_tools import log_debug_event
+
+CLAUDE_CODE_USER_AGENT = "claude-cli/2.0.1 (external, cli)"
+CLAUDE_CODE_BETA = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
 
 
 @dataclass(slots=True)
@@ -51,6 +55,7 @@ class ProviderClient(Protocol):
         tool_choice: str | dict[str, Any] | None = None,
         response_format: dict[str, Any] | None = None,
         cache_control: bool = False,
+        prompt_cache_key: str | None = None,
     ) -> ProviderResponse:
         ...
 
@@ -80,6 +85,7 @@ class OpenAICompatibleClient:
         tool_choice: str | dict[str, Any] | None = None,
         response_format: dict[str, Any] | None = None,
         cache_control: bool = False,
+        prompt_cache_key: str | None = None,
     ) -> ProviderResponse:
         payload = {
             "model": self.config.model,
@@ -95,6 +101,8 @@ class OpenAICompatibleClient:
         if response_format is not None:
             payload["response_format"] = _openai_chat_response_format(response_format)
         _ = cache_control
+        if prompt_cache_key is not None:
+            payload["prompt_cache_key"] = prompt_cache_key
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
@@ -109,6 +117,23 @@ class OpenAICompatibleClient:
         request_info = _request_info("POST", url, headers, payload)
         raw["_request"] = request_info
         text = raw.get("choices", [{}])[0].get("message", {}).get("content") or ""
+        log_debug_event(
+            self.config,
+            "provider.complete",
+            {
+                "method": "POST",
+                "url": url,
+                "status_code": response.status_code,
+                "latency_ms": round(latency_ms, 2),
+                "content_type": response.headers.get("content-type", ""),
+                "request": request_info,
+                "usage": raw.get("usage", {}),
+                "response_model": raw.get("model"),
+                "response_preview": text[:500],
+                "retries": retry_info["retries"],
+                "transient_failures": retry_info["transient_failures"],
+            },
+        )
         return ProviderResponse(
             text=text,
             raw=raw,
@@ -166,6 +191,21 @@ class OpenAICompatibleClient:
                             chunks.append(text)
         latency_ms = (perf_counter() - started) * 1000
         request_info = _request_info("POST", url, headers, payload)
+        log_debug_event(
+            self.config,
+            "provider.stream_complete",
+            {
+                "method": "POST",
+                "url": url,
+                "latency_ms": round(latency_ms, 2),
+                "first_token_ms": None if first_token_ms is None else round(first_token_ms, 2),
+                "chunk_count": len(events),
+                "content_type": content_type,
+                "request": request_info,
+                "usage": usage,
+                "response_preview": "".join(chunks)[:500],
+            },
+        )
         return ProviderStreamResponse(
             text="".join(chunks),
             raw_events=events,
@@ -195,6 +235,7 @@ class OpenAIResponsesClient:
         tool_choice: str | dict[str, Any] | None = None,
         response_format: dict[str, Any] | None = None,
         cache_control: bool = False,
+        prompt_cache_key: str | None = None,
     ) -> ProviderResponse:
         payload = {
             "model": self.config.model,
@@ -209,6 +250,7 @@ class OpenAIResponsesClient:
         if response_format is not None:
             payload["text"] = {"format": _responses_text_format(response_format)}
         _ = cache_control
+        _ = prompt_cache_key
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
@@ -224,6 +266,23 @@ class OpenAIResponsesClient:
         request_info = _request_info("POST", url, headers, payload)
         raw["_request"] = request_info
         text = _extract_responses_text(raw)
+        log_debug_event(
+            self.config,
+            "provider.complete",
+            {
+                "method": "POST",
+                "url": url,
+                "status_code": response.status_code,
+                "latency_ms": round(latency_ms, 2),
+                "content_type": response.headers.get("content-type", ""),
+                "request": request_info,
+                "usage": raw.get("usage", {}),
+                "response_model": raw.get("model"),
+                "response_preview": text[:500],
+                "retries": retry_info["retries"],
+                "transient_failures": retry_info["transient_failures"],
+            },
+        )
         return ProviderResponse(
             text=text,
             raw=raw,
@@ -280,6 +339,21 @@ class OpenAIResponsesClient:
                         chunks.append(delta)
         latency_ms = (perf_counter() - started) * 1000
         request_info = _request_info("POST", url, headers, payload)
+        log_debug_event(
+            self.config,
+            "provider.stream_complete",
+            {
+                "method": "POST",
+                "url": url,
+                "latency_ms": round(latency_ms, 2),
+                "first_token_ms": None if first_token_ms is None else round(first_token_ms, 2),
+                "chunk_count": len(events),
+                "content_type": content_type,
+                "request": request_info,
+                "usage": usage,
+                "response_preview": "".join(chunks)[:500],
+            },
+        )
         return ProviderStreamResponse(
             text="".join(chunks),
             raw_events=events,
@@ -307,6 +381,7 @@ class AnthropicClient:
         tool_choice: str | dict[str, Any] | None = None,
         response_format: dict[str, Any] | None = None,
         cache_control: bool = False,
+        prompt_cache_key: str | None = None,
     ) -> ProviderResponse:
         payload = {
             "model": self.config.model,
@@ -320,16 +395,14 @@ class AnthropicClient:
             payload["tool_choice"] = _anthropic_tool_choice(tool_choice)
         # Anthropic Messages API does not use OpenAI-style response_format.
         _ = response_format
+        _ = prompt_cache_key
         headers = {
             "anthropic-version": self.config.extra_headers.get("anthropic-version", "2023-06-01"),
             "Content-Type": "application/json",
             **self.config.extra_headers,
         }
         if self.config.client_profile == ClientProfile.CLAUDE_CODE:
-            headers["Authorization"] = f"Bearer {self.config.api_key}"
-            headers["User-Agent"] = "api-probe claude-code profile"
-            headers.setdefault("X-Claude-Code-Session-Id", self.config.metadata.setdefault("claude_code_session_id", str(uuid.uuid4())))
-            headers.setdefault("X-Claude-Code-Agent-Id", self.config.metadata.setdefault("claude_code_agent_id", str(uuid.uuid4())))
+            headers.update(_claude_code_headers(self.config))
         else:
             headers["x-api-key"] = self.config.api_key
         url = self.config.base_url.rstrip("/") + "/messages"
@@ -345,8 +418,26 @@ class AnthropicClient:
             for part in raw.get("content", [])
             if isinstance(part, dict) and part.get("type") == "text"
         ]
+        text = "".join(text_parts)
+        log_debug_event(
+            self.config,
+            "provider.complete",
+            {
+                "method": "POST",
+                "url": url,
+                "status_code": response.status_code,
+                "latency_ms": round(latency_ms, 2),
+                "content_type": response.headers.get("content-type", ""),
+                "request": request_info,
+                "usage": raw.get("usage", {}),
+                "response_model": raw.get("model"),
+                "response_preview": text[:500],
+                "retries": retry_info["retries"],
+                "transient_failures": retry_info["transient_failures"],
+            },
+        )
         return ProviderResponse(
-            text="".join(text_parts),
+            text=text,
             raw=raw,
             usage=raw.get("usage", {}),
             latency_ms=latency_ms,
@@ -377,10 +468,7 @@ class AnthropicClient:
             **self.config.extra_headers,
         }
         if self.config.client_profile == ClientProfile.CLAUDE_CODE:
-            headers["Authorization"] = f"Bearer {self.config.api_key}"
-            headers["User-Agent"] = "api-probe claude-code profile"
-            headers.setdefault("X-Claude-Code-Session-Id", self.config.metadata.setdefault("claude_code_session_id", str(uuid.uuid4())))
-            headers.setdefault("X-Claude-Code-Agent-Id", self.config.metadata.setdefault("claude_code_agent_id", str(uuid.uuid4())))
+            headers.update(_claude_code_headers(self.config))
         else:
             headers["x-api-key"] = self.config.api_key
         url = self.config.base_url.rstrip("/") + "/messages"
@@ -410,6 +498,21 @@ class AnthropicClient:
                         chunks.append(text)
         latency_ms = (perf_counter() - started) * 1000
         request_info = _request_info("POST", url, headers, payload)
+        log_debug_event(
+            self.config,
+            "provider.stream_complete",
+            {
+                "method": "POST",
+                "url": url,
+                "latency_ms": round(latency_ms, 2),
+                "first_token_ms": None if first_token_ms is None else round(first_token_ms, 2),
+                "chunk_count": len(events),
+                "content_type": content_type,
+                "request": request_info,
+                "usage": usage,
+                "response_preview": "".join(chunks)[:500],
+            },
+        )
         return ProviderStreamResponse(
             text="".join(chunks),
             raw_events=events,
@@ -430,6 +533,16 @@ def build_client(config: TargetConfig) -> ProviderClient:
     if config.provider_family.value == "anthropic":
         return AnthropicClient(config)
     raise ValueError(f"Unsupported provider family: {config.provider_family}")
+
+
+def _claude_code_headers(config: TargetConfig) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {config.api_key}",
+        "User-Agent": config.extra_headers.get("User-Agent", CLAUDE_CODE_USER_AGENT),
+        "x-app": config.extra_headers.get("x-app", "cli"),
+        "anthropic-beta": config.extra_headers.get("anthropic-beta", CLAUDE_CODE_BETA),
+        "x-claude-code-session-id": config.metadata.setdefault("claude_code_session_id", str(uuid.uuid4())),
+    }
 
 
 def _json_or_error(response: httpx.Response) -> dict[str, Any]:

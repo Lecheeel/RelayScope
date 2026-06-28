@@ -8,6 +8,7 @@ const DEFAULT_SETTINGS = {
   max_retries: 2,
   retry_backoff_seconds: 0.8,
   cache_probe_delay_seconds: 1.2,
+  debug_mode: false,
 };
 
 const form = document.querySelector("#probeForm");
@@ -19,6 +20,7 @@ const settingConcurrency = document.querySelector("#settingConcurrency");
 const settingRetries = document.querySelector("#settingRetries");
 const settingRetryBackoff = document.querySelector("#settingRetryBackoff");
 const settingCacheDelay = document.querySelector("#settingCacheDelay");
+const settingDebugMode = document.querySelector("#settingDebugMode");
 const settingsButton = document.querySelector("#settingsButton");
 const settingsModalElement = document.querySelector("#settingsModal");
 const saveSettingsButton = document.querySelector("#saveSettingsButton");
@@ -30,37 +32,44 @@ const detailModalElement = document.querySelector("#detailModal");
 const detailModalTitle = document.querySelector("#detailModalTitle");
 const detailModalSubtitle = document.querySelector("#detailModalSubtitle");
 const detailModalBody = document.querySelector("#detailModalBody");
-const detailModal = window.bootstrap ? new bootstrap.Modal(detailModalElement) : null;
+const detailModal = detailModalElement && window.bootstrap ? new bootstrap.Modal(detailModalElement) : null;
 let resolveModelChoice = null;
 let latestResults = [];
 let settings = loadSettings();
 
 applySettingsToForm();
 
-settingsButton.addEventListener("click", () => {
-  applySettingsToForm();
-  if (settingsModal) settingsModal.show();
-});
-
-saveSettingsButton.addEventListener("click", () => {
-  settings = normalizeSettings({
-    timeout_seconds: Number(settingTimeout.value),
-    max_concurrency: Number(settingConcurrency.value),
-    max_retries: Number(settingRetries.value),
-    retry_backoff_seconds: Number(settingRetryBackoff.value),
-    cache_probe_delay_seconds: Number(settingCacheDelay.value),
+if (settingsButton) {
+  settingsButton.addEventListener("click", () => {
+    applySettingsToForm();
+    if (settingsModal) settingsModal.show();
   });
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-  if (settingsModal) settingsModal.hide();
-  statusText.textContent = `设置已保存：超时 ${settings.timeout_seconds}s，并发 ${settings.max_concurrency}`;
-});
+}
 
-closeModelModal.addEventListener("click", () => closeModelPicker(null));
-modelModal.addEventListener("click", (event) => {
-  if (event.target === modelModal) {
-    closeModelPicker(null);
-  }
-});
+if (saveSettingsButton) {
+  saveSettingsButton.addEventListener("click", () => {
+    settings = normalizeSettings({
+      timeout_seconds: Number(settingTimeout.value),
+      max_concurrency: Number(settingConcurrency.value),
+      max_retries: Number(settingRetries.value),
+      retry_backoff_seconds: Number(settingRetryBackoff.value),
+      cache_probe_delay_seconds: Number(settingCacheDelay.value),
+      debug_mode: Boolean(settingDebugMode && settingDebugMode.checked),
+    });
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    if (settingsModal) settingsModal.hide();
+    statusText.textContent = `设置已保存：超时 ${settings.timeout_seconds}s，并发 ${settings.max_concurrency}`;
+  });
+}
+
+if (closeModelModal) closeModelModal.addEventListener("click", () => closeModelPicker(null));
+if (modelModal) {
+  modelModal.addEventListener("click", (event) => {
+    if (event.target === modelModal) {
+      closeModelPicker(null);
+    }
+  });
+}
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -72,6 +81,7 @@ form.addEventListener("submit", async (event) => {
     max_retries: Number(data.max_retries),
     retry_backoff_seconds: Number(data.retry_backoff_seconds),
     cache_probe_delay_seconds: Number(data.cache_probe_delay_seconds),
+    debug_mode: data.debug_mode === "true" || Boolean(settingDebugMode && settingDebugMode.checked),
   });
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
   Object.assign(data, settings);
@@ -133,6 +143,9 @@ function setBusy(isBusy) {
 }
 
 function openModelPicker(models) {
+  if (!modelModal || !modelList) {
+    return Promise.resolve(models[0] || null);
+  }
   modelList.innerHTML = "";
   for (const model of models) {
     const item = document.createElement("button");
@@ -149,6 +162,7 @@ function openModelPicker(models) {
 }
 
 function closeModelPicker(model) {
+  if (!modelModal) return;
   modelModal.classList.remove("open");
   if (resolveModelChoice) {
     resolveModelChoice(model);
@@ -241,6 +255,7 @@ function renderResult(data) {
             <div>
               <h2>分析测试结果</h2>
               <p class="fine-print">评分、速度、缓存和 token 成本根据本次返回的 usage 与延迟字段计算。</p>
+              ${renderDebugNote(summary)}
             </div>
             <span class="chip">${escapeHtml(riskTitle(summary.risk_level))}</span>
           </div>
@@ -277,16 +292,24 @@ function renderResult(data) {
     }
 
 function renderAnalysisGrid(summary) {
+      const cacheUsageStatus = formatCacheUsageStatus(summary);
+      const cacheObservationMode = formatCacheObservationMode(summary);
+      const cacheGroups = formatCacheGroups(summary);
       const items = [
         ["评分", summary.score],
         ["通过", `${summary.passed}/${summary.scored_count || summary.probe_count}`],
         ["总项/跳过", `${summary.probe_count} / ${summary.skipped || 0}`],
-        ["缓存命中率", formatPercent(summary.cache_hit_rate)],
+        ["缓存命中率", formatCacheHitRate(summary)],
+        ["缓存观测", cacheObservationMode],
+        ["缓存 usage 字段", cacheUsageStatus],
+        ["缓存分组", cacheGroups],
         ["平均延迟", formatMs(summary.avg_latency_ms)],
         ["tokens/秒", formatNumber(summary.tokens_per_second)],
         ["输入/输出 tokens", `${formatNumber(summary.input_tokens)} / ${formatNumber(summary.output_tokens)}`],
         ["缓存读取 tokens", formatNumber(summary.cached_tokens)],
         ["缓存写入 tokens", formatNumber(summary.cache_creation_tokens)],
+        ["黑盒命中率", formatBlackboxCacheHitRate(summary)],
+        ["黑盒缓存样本", formatBlackboxSampleCount(summary)],
         ["参考 token 用量", formatNumber(summary.reference_tokens)],
         ["加权 token 用量", formatNumber(summary.weighted_tokens)],
         ["综合倍率", summary.composite_multiplier === null || summary.composite_multiplier === undefined ? "未知" : `${summary.composite_multiplier}x`],
@@ -299,6 +322,66 @@ function renderAnalysisGrid(summary) {
           <strong>${escapeHtml(value)}</strong>
         </div>
       `).join("")}</div>`;
+    }
+
+function renderDebugNote(summary) {
+      const debug = summary.debug || {};
+      if (!debug.enabled) return "";
+      return `<p class="fine-print">调试日志：${escapeHtml(debug.log_path || "-")}</p>`;
+    }
+
+function formatCacheHitRate(summary) {
+      if (summary.cache_usage_status === "not_reported" || summary.cache_usage_status === "no_usage_samples") {
+        return "未上报";
+      }
+      return formatPercent(summary.cache_hit_rate);
+    }
+
+function formatBlackboxCacheHitRate(summary) {
+      if (summary.cache_observation_mode !== "blackbox") {
+        return summary.blackbox_cache_hit_rate === null || summary.blackbox_cache_hit_rate === undefined
+          ? "-"
+          : formatPercent(summary.blackbox_cache_hit_rate);
+      }
+      return formatPercent(summary.blackbox_cache_hit_rate);
+    }
+
+function formatBlackboxSampleCount(summary) {
+      const value = summary.blackbox_cache_sample_count;
+      if (value === null || value === undefined) return "-";
+      return formatNumber(value);
+    }
+
+function formatCacheUsageStatus(summary) {
+      const sampleText = `${formatNumber(summary.cache_metric_sample_count)}/${formatNumber(summary.cache_sample_count)}`;
+      const labels = {
+        reported: "已上报",
+        partial: "部分上报",
+        not_reported: "未上报",
+        no_usage_samples: "无样本",
+      };
+      const label = labels[summary.cache_usage_status] || "未知";
+      return `${label} ${sampleText}`;
+    }
+
+function formatCacheGroups(summary) {
+      const groups = summary.cache_groups || {};
+      const precise = groups.precise || {};
+      const blackbox = groups.blackbox || {};
+      const preciseLabel = `${precise.available ? "精确可用" : "精确不可用"} ${formatPercent(precise.hit_rate)}`;
+      const blackboxLabel = `${blackbox.available ? "黑盒可用" : "黑盒不可用"} ${formatPercent(blackbox.hit_rate)}`;
+      return `${preciseLabel} · ${blackboxLabel}`;
+    }
+
+function formatCacheObservationMode(summary) {
+      const labels = {
+        precise: "精确 usage",
+        blackbox: "黑盒估算",
+        unknown: "无结论",
+      };
+      const label = labels[summary.cache_observation_mode] || "无结论";
+      const note = summary.blackbox_cache_note || summary.cache_usage_note || "";
+      return note ? `${label} · ${note}` : label;
     }
 
 function renderStopNotice(summary) {
@@ -367,21 +450,24 @@ function normalizeSettings(value) {
   const retries = Number(value.max_retries);
   const backoff = Number(value.retry_backoff_seconds);
   const cacheDelay = Number(value.cache_probe_delay_seconds);
+  const debugMode = value.debug_mode === true || value.debug_mode === "true";
   return {
     timeout_seconds: Math.max(10, Math.min(240, Number.isFinite(timeout) ? Math.round(timeout) : DEFAULT_SETTINGS.timeout_seconds)),
     max_concurrency: Math.max(1, Math.min(8, Number.isFinite(concurrency) ? Math.round(concurrency) : DEFAULT_SETTINGS.max_concurrency)),
     max_retries: Math.max(0, Math.min(5, Number.isFinite(retries) ? Math.round(retries) : DEFAULT_SETTINGS.max_retries)),
     retry_backoff_seconds: Math.max(0.1, Math.min(5, Number.isFinite(backoff) ? Number(backoff.toFixed(1)) : DEFAULT_SETTINGS.retry_backoff_seconds)),
     cache_probe_delay_seconds: Math.max(0, Math.min(5, Number.isFinite(cacheDelay) ? Number(cacheDelay.toFixed(1)) : DEFAULT_SETTINGS.cache_probe_delay_seconds)),
+    debug_mode: debugMode,
   };
 }
 
 function applySettingsToForm() {
-  settingTimeout.value = settings.timeout_seconds;
-  settingConcurrency.value = settings.max_concurrency;
-  settingRetries.value = settings.max_retries;
-  settingRetryBackoff.value = settings.retry_backoff_seconds;
-  settingCacheDelay.value = settings.cache_probe_delay_seconds;
+  if (settingTimeout) settingTimeout.value = settings.timeout_seconds;
+  if (settingConcurrency) settingConcurrency.value = settings.max_concurrency;
+  if (settingRetries) settingRetries.value = settings.max_retries;
+  if (settingRetryBackoff) settingRetryBackoff.value = settings.retry_backoff_seconds;
+  if (settingCacheDelay) settingCacheDelay.value = settings.cache_probe_delay_seconds;
+  if (settingDebugMode) settingDebugMode.checked = Boolean(settings.debug_mode);
 }
 
 function inferProviderFamily(model) {

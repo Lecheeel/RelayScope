@@ -96,6 +96,11 @@
             <input class="form-control" id="settingCacheDelay" name="cache_probe_delay_seconds" type="number" min="0" max="5" step="0.1">
             <div class="form-text">缓存探针会串行放到最后执行，并在重复请求之间等待该时长。</div>
           </div>
+          <div class="form-check mb-3">
+            <input class="form-check-input" id="settingDebugMode" type="checkbox">
+            <label class="form-check-label" for="settingDebugMode">调试模式</label>
+            <div class="form-text">记录本次检测的请求、响应摘要、usage、延迟和缓存判定到本地 JSONL 日志。</div>
+          </div>
           <a class="btn btn-outline-secondary w-100" href="/advanced.html">打开高级测试页面</a>
         </div>
         <div class="modal-footer">

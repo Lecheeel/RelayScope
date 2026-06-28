@@ -11,6 +11,7 @@ from .config import ClientProfile
 from .models import ProbeResult
 from .probes import _categorize_exception
 from .providers import ProviderClient
+from .providers import CLAUDE_CODE_BETA, CLAUDE_CODE_USER_AGENT
 
 
 @dataclass(slots=True)
@@ -215,9 +216,10 @@ def _claude_code_headers(config: Any) -> dict[str, str]:
         "Authorization": f"Bearer {config.api_key}",
         "Content-Type": "application/json",
         "anthropic-version": config.extra_headers.get("anthropic-version", "2023-06-01"),
-        "User-Agent": "api-probe claude-code profile",
-        "X-Claude-Code-Session-Id": str(uuid.uuid4()),
-        "X-Claude-Code-Agent-Id": str(uuid.uuid4()),
+        "User-Agent": config.extra_headers.get("User-Agent", CLAUDE_CODE_USER_AGENT),
+        "x-app": config.extra_headers.get("x-app", "cli"),
+        "anthropic-beta": config.extra_headers.get("anthropic-beta", CLAUDE_CODE_BETA),
+        "x-claude-code-session-id": config.metadata.setdefault("claude_code_session_id", str(uuid.uuid4())),
         **config.extra_headers,
     }
     return headers

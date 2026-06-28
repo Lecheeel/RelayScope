@@ -76,7 +76,7 @@ def load_run_configs(path: str) -> list[RunConfig]:
             max_retries=int(item.get("max_retries", 2)),
             retry_backoff_seconds=float(item.get("retry_backoff_seconds", 0.8)),
             cache_probe_delay_seconds=float(item.get("cache_probe_delay_seconds", 1.2)),
-            metadata=item.get("metadata", {}),
+            metadata=_debug_metadata(item),
         )
         profiles = item.get("profiles")
         if profiles:
@@ -109,6 +109,15 @@ def _expand_env(value: str) -> str:
 
         return os.environ[value[2:-1]]
     return value
+
+
+def _debug_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = dict(item.get("metadata", {}))
+    if bool(item.get("debug_mode", False)):
+        metadata["debug_mode"] = True
+        if isinstance(item.get("debug_log_path"), str):
+            metadata["debug_log_path"] = item["debug_log_path"]
+    return metadata
 
 
 def _protocol_mode_for_profile(family: ProviderFamily, profile: ClientProfile) -> ProtocolMode:

@@ -23,14 +23,11 @@ class UsageMetrics:
 
     @property
     def cache_hit_rate(self) -> float | None:
-        total = sum(
-            value
-            for value in (self.input_tokens, self.cached_tokens, self.cache_creation_tokens)
-            if isinstance(value, int)
-        )
-        if total <= 0 or self.cached_tokens is None:
+        if not isinstance(self.input_tokens, int) or self.input_tokens <= 0:
             return None
-        return self.cached_tokens / total
+        if not isinstance(self.cached_tokens, int) or self.cached_tokens < 0:
+            return None
+        return self.cached_tokens / self.input_tokens
 
 
 @dataclass(frozen=True, slots=True)

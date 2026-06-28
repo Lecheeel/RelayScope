@@ -58,6 +58,8 @@ def main() -> int:
     parser.add_argument("--name", default="target")
     parser.add_argument("--output-dir", default="runs")
     parser.add_argument("--timeout", type=float, default=60.0)
+    parser.add_argument("--debug", action="store_true", help="write JSONL debug logs for probe requests and results")
+    parser.add_argument("--debug-log-path", default=None, help="debug log path, default: runs/debug-<target>.jsonl")
     parser.add_argument("--config")
     args = parser.parse_args()
 
@@ -106,6 +108,9 @@ def _resolve_run_configs(args: argparse.Namespace) -> list[RunConfig]:
         raise SystemExit(f"Missing required args without --config: {', '.join(missing)}")
     target = build_default_target(args.name, args.base_url, args.api_key, args.model, args.provider, args.profile)
     target.timeout_seconds = args.timeout
+    if args.debug:
+        target.metadata["debug_mode"] = True
+        target.metadata["debug_log_path"] = args.debug_log_path or f"runs/debug-{args.name}.jsonl"
     return [RunConfig(target=target, output_dir=args.output_dir)]
 
 
